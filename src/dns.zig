@@ -86,7 +86,7 @@ fn udpSocket(addr_family: std.posix.sa_family_t) !std.posix.fd_t {
     const flags = std.posix.SOCK.DGRAM | if (builtin.os.tag == .linux) std.posix.SOCK.CLOEXEC else 0;
     if (builtin.os.tag == .linux) {
         const rc = std.os.linux.socket(@intCast(addr_family), @intCast(flags), @intCast(std.posix.IPPROTO.UDP));
-        return switch (std.posix.errno(rc)) {
+        return switch (compat.rawErrno(rc)) {
             .SUCCESS => @intCast(rc),
             else => |err| std.posix.unexpectedErrno(err),
         };
@@ -124,7 +124,7 @@ fn queryType(
 fn sendTo(sock: std.posix.fd_t, bytes: []const u8, addr: *const std.posix.sockaddr, len: std.posix.socklen_t) !usize {
     if (builtin.os.tag == .linux) {
         const rc = std.os.linux.sendto(sock, bytes.ptr, bytes.len, 0, addr, len);
-        return switch (std.posix.errno(rc)) {
+        return switch (compat.rawErrno(rc)) {
             .SUCCESS => rc,
             else => |err| std.posix.unexpectedErrno(err),
         };
@@ -139,7 +139,7 @@ fn sendTo(sock: std.posix.fd_t, bytes: []const u8, addr: *const std.posix.sockad
 fn recvFrom(sock: std.posix.fd_t, buf: []u8) !usize {
     if (builtin.os.tag == .linux) {
         const rc = std.os.linux.recvfrom(sock, buf.ptr, buf.len, 0, null, null);
-        return switch (std.posix.errno(rc)) {
+        return switch (compat.rawErrno(rc)) {
             .SUCCESS => rc,
             else => |err| std.posix.unexpectedErrno(err),
         };

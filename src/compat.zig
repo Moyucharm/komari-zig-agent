@@ -68,6 +68,10 @@ pub const FileWriter = fs.FileWriter;
 pub const fileWriter = fs.fileWriter;
 pub const readAll = fs.readAll;
 
+/// Decode errno from a raw `std.os.linux.*` syscall return value.
+/// `std.posix.errno` always reports `.SUCCESS` for those, because its `rc == -1`
+/// test can never hold for a `usize`. See `compat/posix.zig` for the full story.
+pub const rawErrno = posix.rawErrno;
 pub const closeFd = posix.closeFd;
 pub const pipe = posix.pipe;
 pub const socket = posix.socket;

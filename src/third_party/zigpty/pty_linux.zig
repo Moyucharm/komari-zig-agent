@@ -5,6 +5,17 @@ const posix = std.posix;
 const linux = std.os.linux;
 const lib = @import("lib.zig");
 
+/// LOCAL PATCH (see NOTICE.md): decode errno from a raw `std.os.linux` syscall return.
+///
+/// Upstream used `std.posix.errno(rc)`, whose libc implementation tests `rc == -1`.
+/// `std.os.linux.*` returns `usize`, and Zig cannot coerce the comptime literal `-1`
+/// into `usize`, so that test is constantly false and every failure — including a
+/// failing `faccessat`, which was therefore reported as "executable" — came back as
+/// `.SUCCESS`.
+fn rawErrno(rc: usize) posix.E {
+    return linux.errno(rc);
+}
+
 extern fn execvpe(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
 extern fn ptsname_r(fd: c_int, buf: [*]u8, buflen: usize) c_int;
 extern fn tcgetpgrp(fd: c_int) c_int;
@@ -68,20 +79,20 @@ fn execveLinkerFallback(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8,
 fn seek(fd: i32, offset: u64) std.posix.E {
     if (@sizeOf(usize) == 4 and offset > std.math.maxInt(usize)) return .OVERFLOW;
     const rc = linux.syscall3(.lseek, @as(usize, @bitCast(@as(isize, fd))), @intCast(offset), linux.SEEK.SET);
-    return std.posix.errno(rc);
+    return rawErrno(rc);
 }
 
 /// Read the PT_INTERP (dynamic linker path) from an ELF binary.
 fn readElfInterp(file: [*:0]const u8, buf: *[256]u8) ?[*:0]const u8 {
     const fd_rc = linux.open(file, .{ .ACCMODE = .RDONLY }, 0);
-    if (std.posix.errno(fd_rc) != .SUCCESS) return null;
+    if (rawErrno(fd_rc) != .SUCCESS) return null;
     defer _ = linux.close(@intCast(fd_rc));
     const fd: i32 = @intCast(fd_rc);
 
     // Read ELF header
     var ehdr: [64]u8 = undefined;
     const n = linux.read(fd, &ehdr, 64);
-    if (std.posix.errno(n) != .SUCCESS or n < 64) return null;
+    if (rawErrno(n) != .SUCCESS or n < 64) return null;
 
     // Verify ELF magic
     if (ehdr[0] != 0x7f or ehdr[1] != 'E' or ehdr[2] != 'L' or ehdr[3] != 'F') return null;
@@ -101,7 +112,7 @@ fn readElfInterp(file: [*:0]const u8, buf: *[256]u8) ?[*:0]const u8 {
         const off = e_phoff + @as(u64, idx) * e_phentsize;
         if (seek(fd, off) != .SUCCESS) continue;
         const pn = linux.read(fd, &ph_buf, @min(e_phentsize, 56));
-        if (std.posix.errno(pn) != .SUCCESS or pn < 56) continue;
+        if (rawErrno(pn) != .SUCCESS or pn < 56) continue;
 
         const p_type = std.mem.readInt(u32, ph_buf[0..4], .little);
         if (p_type != 3) continue; // PT_INTERP = 3
@@ -112,7 +123,7 @@ fn readElfInterp(file: [*:0]const u8, buf: *[256]u8) ?[*:0]const u8 {
 
         if (seek(fd, p_offset) != .SUCCESS) return null;
         const rn = linux.read(fd, buf, @intCast(p_filesz));
-        if (std.posix.errno(rn) != .SUCCESS or rn < p_filesz) return null;
+        if (rawErrno(rn) != .SUCCESS or rn < p_filesz) return null;
 
         // Ensure null-terminated
         const len: usize = @intCast(p_filesz);
@@ -130,7 +141,7 @@ fn readElfInterp(file: [*:0]const u8, buf: *[256]u8) ?[*:0]const u8 {
 
 /// Check if a file has executable permission (but may be on a noexec mount).
 fn isExecutable(path: [*:0]const u8) bool {
-    return std.posix.errno(linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0)) == .SUCCESS;
+    return rawErrno(linux.faccessat(linux.AT.FDCWD, path, linux.X_OK, 0)) == .SUCCESS;
 }
 
 /// Resolve a command name to a full path by searching PATH from envp.
@@ -148,7 +159,7 @@ fn resolveInPath(file: []const u8, envp: [*:null]const ?[*:0]const u8) ?[*:0]con
         resolve_buf[dir.len + 1 + file.len] = 0;
         const full: [*:0]const u8 = @ptrCast(resolve_buf[0 .. dir.len + 1 + file.len :0]);
         // Check if the file exists and is executable
-        if (std.posix.errno(linux.faccessat(linux.AT.FDCWD, full, linux.X_OK, 0)) == .SUCCESS) {
+        if (rawErrno(linux.faccessat(linux.AT.FDCWD, full, linux.X_OK, 0)) == .SUCCESS) {
             return full;
         }
     }
@@ -479,11 +490,11 @@ pub fn closeExcessFds() void {
     // child inherits libtermux-exec.so's SIGSYS handler — without it,
     // seccomp kills the process instead of returning ENOSYS.
     const rc = linux.syscall3(.close_range, 3, std.math.maxInt(c_uint), 0);
-    if (std.posix.errno(rc) == .SUCCESS) return;
+    if (rawErrno(rc) == .SUCCESS) return;
 
     // Fallback: raw getdents64 on /proc/self/fd (no allocator, async-signal-safe)
     const dir_fd = linux.open("/proc/self/fd", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
-    if (std.posix.errno(dir_fd) != .SUCCESS) {
+    if (rawErrno(dir_fd) != .SUCCESS) {
         // Last resort: brute-force close FDs 3..256
         var fd: c_int = 3;
         while (fd < 256) : (fd += 1) _ = linux.close(@intCast(fd));
@@ -494,7 +505,7 @@ pub fn closeExcessFds() void {
     var buf: [1024]u8 = undefined;
     while (true) {
         const nread = linux.getdents64(@intCast(dir_fd), @ptrCast(&buf), buf.len);
-        if (std.posix.errno(nread) != .SUCCESS or nread == 0) break;
+        if (rawErrno(nread) != .SUCCESS or nread == 0) break;
 
         var offset: usize = 0;
         while (offset < nread) {

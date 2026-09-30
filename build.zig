@@ -147,6 +147,7 @@ pub fn build(b: *std.Build) void {
         "test/v2_state_test.zig",
         "test/ws_client_test.zig",
         "test/raw_conn_test.zig",
+        "test/raw_errno_test.zig",
         "test/thread_stack_test.zig",
         "test/report_interval_test.zig",
         "test/netstatic_test.zig",
@@ -188,6 +189,13 @@ fn addTest(
     tests.root_module.addOptions("build_options", opts);
     addCompatImports(tests.root_module, compat_module, net_module);
     tests.root_module.addImport("debug", debug_module);
+    // Match the shipped binaries, which always link libc. Without this the suite runs
+    // with `builtin.link_libc == false`, where `std.posix.errno` resolves to the
+    // correct `std.os.linux.errno` and whole classes of libc-dependent bugs (see
+    // test/raw_errno_test.zig) become invisible to the tests.
+    if (target.result.os.tag != .windows) {
+        tests.root_module.link_libc = true;
+    }
     const report_netstatic = b.createModule(.{
         .root_source_file = b.path("src/report/netstatic.zig"),
         .target = target,

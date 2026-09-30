@@ -645,12 +645,12 @@ fn runBinaryPreflightLinux(allocator: std.mem.Allocator, path: []const u8) !void
     defer allocator.free(path_z);
 
     const dev_null = linux.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
-    if (std.posix.errno(dev_null) != .SUCCESS) return error.UpdatePreflightFailed;
+    if (compat.rawErrno(dev_null) != .SUCCESS) return error.UpdatePreflightFailed;
     const dev_null_fd: std.posix.fd_t = @intCast(dev_null);
     defer _ = linux.close(dev_null_fd);
 
     const rc = linux.fork();
-    switch (std.posix.errno(rc)) {
+    switch (compat.rawErrno(rc)) {
         .SUCCESS => {},
         .AGAIN, .NOMEM => return error.SystemResources,
         else => return error.UpdatePreflightFailed,
@@ -670,7 +670,7 @@ fn runBinaryPreflightLinux(allocator: std.mem.Allocator, path: []const u8) !void
     var status: u32 = undefined;
     while (true) {
         const wait_rc = linux.waitpid(pid, &status, 0);
-        switch (std.posix.errno(wait_rc)) {
+        switch (compat.rawErrno(wait_rc)) {
             .SUCCESS => break,
             .INTR => continue,
             else => return error.UpdatePreflightFailed,

@@ -1,6 +1,17 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+/// Decode errno from a raw `std.os.linux.*` syscall return value.
+///
+/// This module sits at the bottom of the dependency graph and deliberately does not
+/// import `compat`, so it carries its own copy of the helper. `std.posix.errno` must
+/// not be used here: its implementation tests `rc == -1`, and since `std.os.linux.*`
+/// returns a `usize` (which cannot represent the comptime literal `-1`), that test is
+/// constantly false and every raw syscall failure is reported as `.SUCCESS`.
+fn rawErrno(rc: usize) std.posix.E {
+    return std.os.linux.errno(rc);
+}
+
 pub const net = std.Io.net;
 pub const Address = net.IpAddress;
 pub const Stream = net.Stream;
@@ -161,7 +172,7 @@ fn connectWithTimeoutLinux(addr: Address, timeout_ms: u64) !Stream {
     errdefer _ = std.os.linux.close(fd);
 
     const sa = sockAddr(addr);
-    switch (std.posix.errno(std.os.linux.connect(fd, sa.ptr(), sa.len))) {
+    switch (rawErrno(std.os.linux.connect(fd, sa.ptr(), sa.len))) {
         .SUCCESS => {},
         .INPROGRESS, .ALREADY, .AGAIN => try waitForConnectLinux(fd, timeout_ms),
         else => |err| return std.posix.unexpectedErrno(err),
@@ -225,7 +236,7 @@ fn timeoutToTimeval(timeout_ms: u64) std.posix.timeval {
 
 fn socketLinux(domain: u32, socket_type: u32, protocol: u32) !std.posix.fd_t {
     const rc = std.os.linux.socket(domain, socket_type, protocol);
-    return switch (std.posix.errno(rc)) {
+    return switch (rawErrno(rc)) {
         .SUCCESS => @intCast(rc),
         .ACCES, .PERM => error.AccessDenied,
         .AFNOSUPPORT => error.AddressFamilyUnsupported,
@@ -255,7 +266,7 @@ fn waitForConnectLinux(fd: std.posix.fd_t, timeout_ms: u64) !void {
         std.mem.asBytes(&err_code).ptr,
         &err_len,
     );
-    switch (std.posix.errno(rc)) {
+    switch (rawErrno(rc)) {
         .SUCCESS => {},
         else => |err| return std.posix.unexpectedErrno(err),
     }
@@ -273,14 +284,14 @@ fn waitForConnectLinux(fd: std.posix.fd_t, timeout_ms: u64) !void {
 
 fn clearNonblockingLinux(fd: std.posix.fd_t) !void {
     const current_rc = std.os.linux.fcntl(fd, std.posix.F.GETFL, 0);
-    const current_bits: u32 = switch (std.posix.errno(current_rc)) {
+    const current_bits: u32 = switch (rawErrno(current_rc)) {
         .SUCCESS => @intCast(current_rc),
         else => |err| return std.posix.unexpectedErrno(err),
     };
     var next_flags: std.posix.O = @bitCast(current_bits);
     next_flags.NONBLOCK = false;
     const next_bits: u32 = @bitCast(next_flags);
-    switch (std.posix.errno(std.os.linux.fcntl(fd, std.posix.F.SETFL, @as(usize, next_bits)))) {
+    switch (rawErrno(std.os.linux.fcntl(fd, std.posix.F.SETFL, @as(usize, next_bits)))) {
         .SUCCESS => {},
         else => |err| return std.posix.unexpectedErrno(err),
     }

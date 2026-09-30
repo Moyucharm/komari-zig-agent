@@ -1305,7 +1305,10 @@ fn diskUsageNative(mountpoint: []const u8) !common.DiskInfo {
 
     var stat = LinuxStatfs{};
     const rc = std.os.linux.syscall2(.statfs, @intFromPtr(path_z.ptr), @intFromPtr(&stat));
-    if (std.posix.errno(rc) != .SUCCESS) return error.StatfsFailed;
+    // 必须用 compat.rawErrno：statfs 是裸系统调用（返回 usize），而 std.posix.errno
+    // 的 `rc == -1` 判断对 usize 恒为 false，失败会被误判为 SUCCESS，进而把未初始化
+    // 的 stat 当成真实磁盘数据上报。详见 compat/posix.zig 的 rawErrno 注释。
+    if (compat.rawErrno(rc) != .SUCCESS) return error.StatfsFailed;
 
     const block_size: u64 = if (stat.f_frsize != 0) @intCast(stat.f_frsize) else @intCast(stat.f_bsize);
     if (block_size == 0) return error.BadStatfsOutput;
