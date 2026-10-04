@@ -132,9 +132,21 @@ pub fn basicInfo(allocator: std.mem.Allocator, options: common.SnapshotOptions) 
     return info;
 }
 
-/// Monotonic nanoseconds for CPU accounting. Wall-clock timestamps are never
+/// Monotonic nanoseconds for CPU accounting.
+///
+/// This deliberately avoids the `std.Io` clock: the process shares one
+/// single-threaded `std.Io` instance between the report loop and the
+/// basic-info thread, and an io-based clock can block when both threads use it.
+/// A vDSO/syscall read has no such coupling. Wall-clock timestamps are never
 /// used here because they can jump backwards across NTP steps.
 fn monotonicNs() i128 {
+    if (comptime @import("builtin").os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts) != 0) return 0;
+        return @as(i128, ts.sec) * std.time.ns_per_s + @as(i128, ts.nsec);
+    }
+    // Non-Linux builds never collect cgroup resources; keep the io clock so the
+    // file still compiles everywhere.
     return @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds());
 }
 
