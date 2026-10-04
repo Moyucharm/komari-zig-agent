@@ -37,6 +37,8 @@ pub const SnapshotOptions = struct {
     host_proc: []const u8 = "",
     memory_include_cache: bool = false,
     memory_report_raw_used: bool = false,
+    resource_mode: []const u8 = "auto",
+    cgroup_path: []const u8 = "",
 };
 
 pub const NetworkInfo = struct {

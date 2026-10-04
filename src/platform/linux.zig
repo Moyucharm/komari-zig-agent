@@ -5,6 +5,9 @@ const netstatic = @import("report_netstatic");
 const compat = @import("compat");
 const debug = @import("debug");
 
+/// Container-aware cgroup resource collector (same-directory module).
+pub const cgroup = @import("linux_cgroup.zig");
+
 const safe_command_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/rocm/bin";
 
 const LinuxFsId = extern struct {
@@ -28,6 +31,8 @@ const LinuxStatfs = extern struct {
 
 var sample_mutex: compat.Mutex = .{};
 var cache_mutex: compat.Mutex = .{};
+var resource_mutex: compat.Mutex = .{};
+var resource_collector: cgroup.Collector = cgroup.Collector.init(.{});
 var previous_network: ?NetworkSample = null;
 var previous_cpu: ?CpuSample = null;
 var cached_disk: ?CachedDiskSample = null;
@@ -84,19 +89,39 @@ const CachedProcessSample = struct {
     timestamp_ms: i64,
 };
 
-pub fn basicInfo(allocator: std.mem.Allocator) !common.BasicInfo {
-    var info = common.BasicInfo{
+pub fn basicInfo(allocator: std.mem.Allocator, options: common.SnapshotOptions) !common.BasicInfo {
+    const resources = sampleResources(options, false);
+    var info = if (resources.scope == .host) blk: {
+        const host_mem = try memAndSwapInfoWithOptions(options);
+        break :blk common.BasicInfo{
+            .cpu = .{
+                .name = try cpuName(allocator),
+                .architecture = normalizeArch(@tagName(@import("builtin").cpu.arch)),
+                .cores = try cpuCoreCount(),
+                .physical_cores = try cpuPhysicalCoreCount(),
+                .usage = 0.001,
+            },
+            .os_name = try osName(allocator),
+            .kernel_version = try readFirstLine(allocator, "/proc/sys/kernel/osrelease"),
+            .mem_total = host_mem.ram.total,
+            .swap_total = host_mem.swap.total,
+            .disk_total = (try diskInfo()).total,
+            .gpu_name = try gpuName(allocator),
+            .virtualization = try virtualization(allocator),
+        };
+    } else common.BasicInfo{
         .cpu = .{
             .name = try cpuName(allocator),
             .architecture = normalizeArch(@tagName(@import("builtin").cpu.arch)),
-            .cores = try cpuCoreCount(),
-            .physical_cores = try cpuPhysicalCoreCount(),
-            .usage = 0.001,
+            .cores = resources.cpu_cores,
+            // Container CPU capacity is a quota, not hardware topology.
+            .physical_cores = 0,
+            .usage = resources.cpu_usage,
         },
         .os_name = try osName(allocator),
         .kernel_version = try readFirstLine(allocator, "/proc/sys/kernel/osrelease"),
-        .mem_total = (try memInfo()).total,
-        .swap_total = (try swapInfo()).total,
+        .mem_total = resources.ram.total,
+        .swap_total = resources.swap.total,
         .disk_total = (try diskInfo()).total,
         .gpu_name = try gpuName(allocator),
         .virtualization = try virtualization(allocator),
@@ -107,12 +132,37 @@ pub fn basicInfo(allocator: std.mem.Allocator) !common.BasicInfo {
     return info;
 }
 
+/// Monotonic nanoseconds for CPU accounting. Wall-clock timestamps are never
+/// used here because they can jump backwards across NTP steps.
+fn monotonicNs() i128 {
+    return @intCast(std.Io.Timestamp.now(std.Options.debug_io, .awake).toNanoseconds());
+}
+
+/// Serialize access to the shared collector. Resource state is deliberately
+/// kept out of the `sample_mutex` used by the legacy whole-machine CPU and
+/// network samples.
+fn sampleResources(options: common.SnapshotOptions, update_cpu_sample: bool) cgroup.ResourceSample {
+    resource_mutex.lock();
+    defer resource_mutex.unlock();
+    return resource_collector.read(options, monotonicNs(), update_cpu_sample);
+}
+
 pub fn snapshot(options: common.SnapshotOptions) !common.Snapshot {
-    const mem_swap = try memAndSwapInfoWithOptions(options);
+    const resources = sampleResources(options, true);
+    var ram_swap: MemSwapInfo = undefined;
+    if (resources.scope == .host) {
+        ram_swap = try memAndSwapInfoWithOptions(options);
+    } else {
+        ram_swap = .{ .ram = resources.ram, .swap = resources.swap };
+    }
+    const cpu = if (resources.scope == .host)
+        common.CpuInfo{ .architecture = normalizeArch(@tagName(@import("builtin").cpu.arch)), .cores = try cpuCoreCount(), .usage = try cpuUsage(options.host_proc) }
+    else
+        common.CpuInfo{ .architecture = normalizeArch(@tagName(@import("builtin").cpu.arch)), .cores = resources.cpu_cores, .usage = resources.cpu_usage };
     return .{
-        .cpu = .{ .architecture = normalizeArch(@tagName(@import("builtin").cpu.arch)), .cores = try cpuCoreCount(), .usage = try cpuUsage(options.host_proc) },
-        .ram = mem_swap.ram,
-        .swap = mem_swap.swap,
+        .cpu = cpu,
+        .ram = ram_swap.ram,
+        .swap = ram_swap.swap,
         .load = try loadInfo(options.host_proc),
         .disk = try cachedDiskInfoWithMountpoints(options.include_mountpoints),
         .network = try networkInfo(options),
@@ -120,6 +170,7 @@ pub fn snapshot(options: common.SnapshotOptions) !common.Snapshot {
         .uptime = try uptime(options.host_proc),
         .process = try cachedProcessCount(options.host_proc),
         .gpu_json = if (options.enable_gpu) gpuReportJson(std.heap.page_allocator) catch "" else "",
+        .message = resources.message,
     };
 }
 
@@ -470,10 +521,10 @@ fn virtualization(allocator: std.mem.Allocator) ![]const u8 {
     if (fileExists("/.dockerenv")) return allocator.dupe(u8, "docker");
     const has_containerenv = fileExists("/run/.containerenv");
 
-    const cgroup = compat.readFileAlloc(allocator, "/proc/self/cgroup", 256 * 1024) catch "";
-    if (cgroup.len != 0) {
-        defer allocator.free(cgroup);
-        const detected = detectContainerFromCgroup(cgroup);
+    const cgroup_bytes = compat.readFileAlloc(allocator, "/proc/self/cgroup", 256 * 1024) catch "";
+    if (cgroup_bytes.len != 0) {
+        defer allocator.free(cgroup_bytes);
+        const detected = detectContainerFromCgroup(cgroup_bytes);
         if (detected.len != 0) return allocator.dupe(u8, detected);
     }
     if (has_containerenv) return allocator.dupe(u8, "container");
@@ -1691,20 +1742,10 @@ fn isNumericCpuValue(value: []const u8) bool {
     return value.len != 0;
 }
 
-fn memInfo() !common.MemInfo {
-    return memInfoFromPath("/proc/meminfo", .{});
-}
-
 pub const MemMode = struct {
     include_cache: bool = false,
     report_raw_used: bool = false,
 };
-
-fn memInfoWithOptions(options: common.SnapshotOptions) !common.MemInfo {
-    const path = try procPath(std.heap.page_allocator, options.host_proc, "meminfo");
-    defer std.heap.page_allocator.free(path);
-    return memInfoFromPath(path, .{ .include_cache = options.memory_include_cache, .report_raw_used = options.memory_report_raw_used });
-}
 
 const MemSwapInfo = struct {
     ram: common.MemInfo,
@@ -1771,22 +1812,6 @@ pub fn parseMemInfo(bytes: []const u8, mode: MemMode) common.MemInfo {
     return .{ .total = info.mem_total, .used = used };
 }
 
-fn memInfoFromPath(path: []const u8, mode: MemMode) !common.MemInfo {
-    var buf: [16 * 1024]u8 = undefined;
-    const bytes = readSmallFile(path, &buf) orelse return .{};
-    return parseMemInfo(bytes, mode);
-}
-
-fn swapInfo() !common.MemInfo {
-    return swapInfoWithRoot("");
-}
-
-fn swapInfoWithRoot(host_proc: []const u8) !common.MemInfo {
-    var buf: [16 * 1024]u8 = undefined;
-    const bytes = readSmallProcFile(host_proc, "meminfo", &buf) orelse return .{};
-    return parseSwapInfo(bytes);
-}
-
 pub fn parseSwapInfo(bytes: []const u8) common.MemInfo {
     const info = parseProcMemInfo(bytes);
     const deductions = info.swap_free + info.swap_cached;
@@ -1796,16 +1821,15 @@ pub fn parseSwapInfo(bytes: []const u8) common.MemInfo {
 pub fn printMemoryCheck(
     allocator: std.mem.Allocator,
     writer: anytype,
-    include_cache: bool,
-    report_raw_used: bool,
+    options: common.SnapshotOptions,
 ) !void {
     var buf: [16 * 1024]u8 = undefined;
-    const bytes = readSmallFile("/proc/meminfo", &buf) orelse "";
+    const bytes = readSmallProcFile(options.host_proc, "meminfo", &buf) orelse "";
 
     try writer.writeAll("--- Memory Check ---\n");
     if (bytes.len != 0) {
         const proc = parseProcMemInfo(bytes);
-        try writer.writeAll("--- /proc/meminfo ---\n");
+        try writer.writeAll("--- /proc/meminfo (reference view) ---\n");
         try printMeminfoField(writer, "MemTotal", proc.mem_total);
         try printMeminfoField(writer, "MemFree", proc.mem_free);
         try printMeminfoField(writer, "MemAvailable", proc.mem_available);
@@ -1827,9 +1851,26 @@ pub fn printMemoryCheck(
         try printRamInfo(writer, "gopsutil", .{});
     }
     try printRamInfo(writer, "callFree", callFree(allocator) catch .{});
+
+    const resources = sampleResources(options, false);
     try writer.writeAll("--- Current Configured ---\n");
-    const current = if (bytes.len != 0) parseMemInfo(bytes, .{ .include_cache = include_cache, .report_raw_used = report_raw_used }) else common.MemInfo{};
-    try printRamInfo(writer, if (include_cache) "includeCache" else "htoplike", current);
+    if (resources.scope == .host) {
+        // Whole-machine view: identical to what the report loop would send.
+        const current = if (bytes.len != 0)
+            parseMemInfo(bytes, .{ .include_cache = options.memory_include_cache, .report_raw_used = options.memory_report_raw_used })
+        else
+            common.MemInfo{};
+        try printRamInfo(writer, if (options.memory_include_cache) "includeCache" else "htoplike", current);
+        try printRamInfo(writer, "swap", if (bytes.len != 0) parseSwapInfo(bytes) else .{});
+    } else {
+        // Container view: the exact values that are reported upstream.
+        try printRamInfo(writer, "container-ram", resources.ram);
+        try printRamInfo(writer, "container-swap", resources.swap);
+    }
+
+    resource_mutex.lock();
+    defer resource_mutex.unlock();
+    try resource_collector.describe(writer);
 }
 
 fn printMeminfoField(writer: anytype, label: []const u8, bytes: u64) !void {

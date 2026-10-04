@@ -277,7 +277,8 @@ extern "iphlpapi" fn GetAdaptersAddresses(
     size_pointer: *windows.DWORD,
 ) callconv(.winapi) windows.DWORD;
 
-pub fn basicInfo(allocator: std.mem.Allocator) !common.BasicInfo {
+pub fn basicInfo(allocator: std.mem.Allocator, options: common.SnapshotOptions) !common.BasicInfo {
+    _ = options;
     const ram = memInfo() catch common.MemInfo{};
     const swap = swapInfo() catch common.MemInfo{};
     const disk = diskInfoWithMountpoints(allocator, "") catch common.DiskInfo{};

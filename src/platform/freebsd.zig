@@ -20,7 +20,8 @@ const NetworkSample = struct {
 };
 
 /// FreeBSD collectors for system info, disks, and interfaces.
-pub fn basicInfo(allocator: std.mem.Allocator) !common.BasicInfo {
+pub fn basicInfo(allocator: std.mem.Allocator, options: common.SnapshotOptions) !common.BasicInfo {
+    _ = options;
     const mem = sysctlInt("hw.physmem") catch 0;
     var info = common.BasicInfo{
         .cpu = .{

@@ -334,3 +334,73 @@ test "config normalize defaults protocol version zero and validates values" {
     cfg.prefer_ip_version = "5";
     try std.testing.expectError(error.InvalidPreferIpVersion, cfg.normalize());
 }
+
+test "resource cli flags parse space and equals forms" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "komari-agent", "--resource-mode", "container", "--cgroup-path=/lxc/demo" };
+    const cfg = try config.parseArgs(arena.allocator(), &args);
+    try std.testing.expectEqualStrings("container", cfg.resource_mode);
+    try std.testing.expectEqualStrings("/lxc/demo", cfg.cgroup_path);
+
+    const eq_args = [_][]const u8{ "komari-agent", "--resource-mode=host" };
+    const eq_cfg = try config.parseArgs(arena.allocator(), &eq_args);
+    try std.testing.expectEqualStrings("host", eq_cfg.resource_mode);
+    try std.testing.expectEqualStrings("", eq_cfg.cgroup_path);
+}
+
+test "json resource options override cli values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const args = [_][]const u8{ "komari-agent", "--resource-mode", "host", "--cgroup-path", "" };
+    var cfg = try config.parseArgs(arena.allocator(), &args);
+    try std.testing.expectEqualStrings("host", cfg.resource_mode);
+    try std.testing.expectEqualStrings("", cfg.cgroup_path);
+
+    const json =
+        \\{"resource_mode": "container", "cgroup_path": "/lxc/demo"}
+    ;
+    try cfg.loadJson(arena.allocator(), json);
+    try cfg.normalize();
+    try std.testing.expectEqualStrings("container", cfg.resource_mode);
+    try std.testing.expectEqualStrings("/lxc/demo", cfg.cgroup_path);
+}
+
+test "resource normalize rejects invalid mode and conflicts" {
+    var cfg = config.Config.default();
+    cfg.resource_mode = "Container";
+    try std.testing.expectError(error.InvalidResourceMode, cfg.normalize());
+
+    cfg = config.Config.default();
+    cfg.resource_mode = "container";
+    cfg.host_proc = "/host/proc";
+    try std.testing.expectError(error.ConflictingResourceOptions, cfg.normalize());
+
+    cfg = config.Config.default();
+    cfg.resource_mode = "host";
+    cfg.cgroup_path = "/lxc/demo";
+    try std.testing.expectError(error.ConflictingResourceOptions, cfg.normalize());
+
+    cfg = config.Config.default();
+    cfg.host_proc = "/host/proc";
+    cfg.cgroup_path = "/lxc/demo";
+    try std.testing.expectError(error.ConflictingResourceOptions, cfg.normalize());
+}
+
+test "resource normalize validates cgroup path syntax" {
+    const invalid = [_][]const u8{ "lxc/demo", "/lxc//demo", "/lxc/../demo", "/lxc/demo/", "/lxc/./demo", "/lxc\x00demo", "/lxc\ndemo" };
+    for (invalid) |path| {
+        var cfg = config.Config.default();
+        cfg.cgroup_path = path;
+        try std.testing.expectError(error.InvalidCgroupPath, cfg.normalize());
+    }
+
+    const valid = [_][]const u8{ "/", "/lxc/demo", "/kubepods.slice/pod.scope" };
+    for (valid) |path| {
+        var cfg = config.Config.default();
+        cfg.cgroup_path = path;
+        try cfg.normalize();
+    }
+}

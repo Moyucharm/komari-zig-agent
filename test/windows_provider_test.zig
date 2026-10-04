@@ -8,7 +8,7 @@ test "windows provider basic info reports windows data" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    const info = try provider.basicInfo(arena.allocator());
+    const info = try provider.basicInfo(arena.allocator(), .{});
     try std.testing.expect(info.mem_total > 0);
     try std.testing.expect(info.disk_total > 0);
     try std.testing.expect(std.ascii.indexOfIgnoreCase(info.os_name, "windows") != null);

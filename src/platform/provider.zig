@@ -11,8 +11,8 @@ const impl = switch (builtin.os.tag) {
     else => @import("linux.zig"),
 };
 
-pub fn basicInfo(allocator: std.mem.Allocator) !common.BasicInfo {
-    return impl.basicInfo(allocator);
+pub fn basicInfo(allocator: std.mem.Allocator, options: common.SnapshotOptions) !common.BasicInfo {
+    return impl.basicInfo(allocator, options);
 }
 
 pub fn snapshot() !common.Snapshot {
@@ -56,18 +56,14 @@ pub fn canProbeIpv6(allocator: std.mem.Allocator, include_nics: []const u8, excl
 pub fn printMemoryCheck(
     allocator: std.mem.Allocator,
     writer: anytype,
-    include_cache: bool,
-    report_raw_used: bool,
+    options: common.SnapshotOptions,
 ) !void {
     if (@hasDecl(impl, "printMemoryCheck")) {
-        return impl.printMemoryCheck(allocator, writer, include_cache, report_raw_used);
+        return impl.printMemoryCheck(allocator, writer, options);
     }
 
     try writer.writeAll("--- Memory Check ---\n");
-    const snap = try impl.snapshot(.{
-        .memory_include_cache = include_cache,
-        .memory_report_raw_used = report_raw_used,
-    });
+    const snap = try impl.snapshot(options);
     try printRamInfo(writer, "current", snap.ram);
 }
 

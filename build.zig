@@ -137,6 +137,7 @@ pub fn build(b: *std.Build) void {
         "test/disk_filter_test.zig",
         "test/network_filter_test.zig",
         "test/cpu_proc_test.zig",
+        "test/linux_cgroup_test.zig",
         "test/task_test.zig",
         "test/ping_test.zig",
         "test/windows_process_test.zig",

@@ -19,7 +19,8 @@ const NetworkSample = struct {
 };
 
 /// macOS collectors for system info, disks, and interfaces.
-pub fn basicInfo(allocator: std.mem.Allocator) !common.BasicInfo {
+pub fn basicInfo(allocator: std.mem.Allocator, options: common.SnapshotOptions) !common.BasicInfo {
+    _ = options;
     var info = common.BasicInfo{
         .cpu = .{
             .name = try commandFirstLine(allocator, &.{ "sysctl", "-n", "machdep.cpu.brand_string" }, "Unknown"),

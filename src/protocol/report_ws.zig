@@ -28,7 +28,7 @@ var v2_ack_mutex: compat.Mutex = .{};
 var v2_ack_event_ids: std.ArrayList([]const u8) = .empty;
 var v2_seen_event_ids: std.ArrayList([]const u8) = .empty;
 
-fn snapshotOptions(cfg: config.Config) common.SnapshotOptions {
+pub fn snapshotOptions(cfg: config.Config) common.SnapshotOptions {
     return .{
         .include_nics = cfg.include_nics,
         .exclude_nics = cfg.exclude_nics,
@@ -38,6 +38,8 @@ fn snapshotOptions(cfg: config.Config) common.SnapshotOptions {
         .host_proc = cfg.host_proc,
         .memory_include_cache = cfg.memory_include_cache,
         .memory_report_raw_used = cfg.memory_report_raw_used,
+        .resource_mode = cfg.resource_mode,
+        .cgroup_path = cfg.cgroup_path,
     };
 }
 
