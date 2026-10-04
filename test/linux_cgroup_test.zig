@@ -631,11 +631,20 @@ test "cpu differential resets, cache ttl and inode change" {
     const after = collector.read(.{ .resource_mode = "auto" }, 1_000_000_000 + 3 * step + ttl + step, true);
     try expectApprox(80.0, after.cpu_usage, 0.5);
 
-    // Replacing the accounting file changes its inode, resetting the baseline.
+    // Replacing the accounting file resets the baseline **when the filesystem
+    // hands out a new inode**. Some filesystems reuse the inode of a deleted
+    // file, in which case the same-file semantics correctly apply instead.
+    const inode_before = (try tmp.dir.statFile(std.testing.io, "cpu.stat", .{})).inode;
     try tmp.dir.deleteFile(std.testing.io, "cpu.stat");
     try writeFile(tmp.dir, "cpu.stat", "usage_usec 5000000\n");
+    const inode_after = (try tmp.dir.statFile(std.testing.io, "cpu.stat", .{})).inode;
     const replaced = collector.read(.{ .resource_mode = "auto" }, 1_000_000_000 + 3 * step + ttl + 2 * step, true);
-    try expectApprox(0.001, replaced.cpu_usage, 1e-9);
+    if (inode_before != inode_after) {
+        try expectApprox(0.001, replaced.cpu_usage, 1e-9);
+    } else {
+        // 600000 usec over 1s at capacity 0.5 is 120%.
+        try expectApprox(120.0, replaced.cpu_usage, 0.5);
+    }
 
     // Recovery: the next increment is measured again.
     try writeFile(tmp.dir, "cpu.stat", "usage_usec 5200000\n");
