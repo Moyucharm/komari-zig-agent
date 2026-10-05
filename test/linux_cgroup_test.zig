@@ -631,23 +631,18 @@ test "cpu differential resets, cache ttl and inode change" {
     const after = collector.read(.{ .resource_mode = "auto" }, 1_000_000_000 + 3 * step + ttl + step, true);
     try expectApprox(80.0, after.cpu_usage, 0.5);
 
-    // Replacing the accounting file resets the baseline **when the filesystem
-    // hands out a new inode**. Some filesystems reuse the inode of a deleted
-    // file, in which case the same-file semantics correctly apply instead.
+    // Keep the old inode allocated so replacement must exercise inode change.
     const inode_before = (try tmp.dir.statFile(std.testing.io, "cpu.stat", .{})).inode;
-    try tmp.dir.deleteFile(std.testing.io, "cpu.stat");
+    try tmp.dir.rename("cpu.stat", tmp.dir, "cpu.stat.old", std.testing.io);
     try writeFile(tmp.dir, "cpu.stat", "usage_usec 5000000\n");
     const inode_after = (try tmp.dir.statFile(std.testing.io, "cpu.stat", .{})).inode;
+    try std.testing.expect(inode_before != inode_after);
     const replaced = collector.read(.{ .resource_mode = "auto" }, 1_000_000_000 + 3 * step + ttl + 2 * step, true);
-    if (inode_before != inode_after) {
-        try expectApprox(0.001, replaced.cpu_usage, 1e-9);
-    } else {
-        // 600000 usec over 1s at capacity 0.5 is 120%.
-        try expectApprox(120.0, replaced.cpu_usage, 0.5);
-    }
+    try expectApprox(0.001, replaced.cpu_usage, 1e-9);
 
     // Recovery: the next increment is measured again.
     try writeFile(tmp.dir, "cpu.stat", "usage_usec 5200000\n");
+    try std.testing.expectEqual(inode_after, (try tmp.dir.statFile(std.testing.io, "cpu.stat", .{})).inode);
     const recovered = collector.read(.{ .resource_mode = "auto" }, 1_000_000_000 + 3 * step + ttl + 3 * step, true);
     try expectApprox(40.0, recovered.cpu_usage, 0.5);
 }
@@ -726,19 +721,23 @@ test "known container with missing target never falls back to host data" {
     try makeDir(tmp.dir, "proc/1");
     try writeFile(tmp.dir, "proc/self/cgroup", "0::/docker/missing\n");
     try writeFile(tmp.dir, "proc/1/cgroup", "0::/docker/missing\n");
-    // No cgroup target directory, no /proc/meminfo, no cpu_online file.
+    // Host data remains readable; a missing container must never consume it.
+    try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 1048576 kB\n");
+    try writeFile(tmp.dir, "online", "0-7\n");
     try writeMountInfoV2(&tmp, root, "");
 
     const collector = try newCollector(sources);
     defer std.testing.allocator.destroy(collector);
-    const sample = collector.read(.{ .resource_mode = "auto" }, 1_000, true);
-
-    try std.testing.expect(sample.scope == .unavailable);
-    try std.testing.expectEqualStrings(msg_unavailable, sample.message);
-    try std.testing.expect(sample.cpu_capacity == null);
-    try std.testing.expectEqual(@as(u32, 0), sample.cpu_cores);
-    try std.testing.expectEqual(@as(u64, 0), sample.ram.total);
-    try std.testing.expect(sample.charged_memory == null);
+    for ([_]bool{ false, true }) |updating| {
+        const sample = collector.read(.{ .resource_mode = "auto" }, 1_000, updating);
+        try std.testing.expect(sample.scope == .unavailable);
+        try std.testing.expectEqualStrings(msg_unavailable, sample.message);
+        try std.testing.expect(sample.cpu_capacity == null);
+        try std.testing.expectEqual(@as(u32, 0), sample.cpu_cores);
+        try std.testing.expectEqual(@as(u64, 0), sample.ram.total);
+        try std.testing.expectEqual(@as(u64, 0), sample.swap.total);
+        try std.testing.expect(sample.charged_memory == null);
+    }
 }
 
 test "host mode forces the host scope" {
@@ -1059,4 +1058,572 @@ test "unreadable quota level leaves the capacity unknown" {
     defer std.testing.allocator.destroy(collector2);
     const recovered = collector2.read(.{ .resource_mode = "auto" }, 1_000, false);
     try expectApprox(2.0, recovered.cpu_capacity.?, 1e-9);
+}
+
+test "cached relocation preserves CPU deltas when memory accounting stays missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try rootOf(&tmp, &root_buf);
+    var paths = Paths{};
+    const sources = try paths.init(root);
+
+    try writeFile(tmp.dir, "dockerenv", "");
+    try writeFile(tmp.dir, "proc/self/cgroup", "0::/\n");
+    try writeFile(tmp.dir, "proc/1/cgroup", "0::/\n");
+    try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 0 kB\n");
+    try writeFile(tmp.dir, "cpu.max", "200000 100000\n");
+    try writeFile(tmp.dir, "cpuset.cpus.effective", "0-1\n");
+    try writeFile(tmp.dir, "cpu.stat", "usage_usec 0\n");
+    try writeFile(tmp.dir, "memory.swap.max", "0\n");
+    try writeFile(tmp.dir, "memory.swap.current", "0\n");
+    try writeMountInfoV2(&tmp, root, "");
+
+    const collector = try newCollector(sources);
+    defer std.testing.allocator.destroy(collector);
+    _ = collector.read(.{}, std.time.ns_per_s, true);
+    try writeFile(tmp.dir, "cpu.stat", "usage_usec 1000000\n");
+    const second = collector.read(.{}, 2 * std.time.ns_per_s, true);
+    try expectApprox(50.0, second.cpu_usage, 1e-9);
+    try std.testing.expect(second.charged_memory == null);
+    try std.testing.expectEqualStrings(msg_unavailable, second.message);
+    try writeFile(tmp.dir, "cpu.stat", "usage_usec 2000000\n");
+    const third = collector.read(.{}, 3 * std.time.ns_per_s, true);
+    try expectApprox(50.0, third.cpu_usage, 1e-9);
+
+    // A cached failure still resolves a moved container boundary immediately.
+    try writeFile(tmp.dir, "proc/self/cgroup", "0::/docker/moved\n");
+    try writeFile(tmp.dir, "proc/1/cgroup", "0::/docker/moved\n");
+    try writeFile(tmp.dir, "docker/moved/cpu.max", "100000 100000\n");
+    try writeFile(tmp.dir, "docker/moved/cpuset.cpus.effective", "0\n");
+    try writeFile(tmp.dir, "docker/moved/cpu.stat", "usage_usec 9000000\n");
+    try writeFile(tmp.dir, "docker/moved/memory.current", "1048576\n");
+    try writeFile(tmp.dir, "docker/moved/memory.max", "2147483648\n");
+    try writeFile(tmp.dir, "docker/moved/memory.stat", "inactive_file 0\n");
+    const moved = collector.read(.{}, 4 * std.time.ns_per_s, true);
+    try expectApprox(1.0, moved.cpu_capacity.?, 1e-9);
+    try expectApprox(0.001, moved.cpu_usage, 1e-9);
+    try std.testing.expectEqual(@as(?u64, 1048576), moved.charged_memory);
+    try writeFile(tmp.dir, "docker/moved/cpu.stat", "usage_usec 9250000\n");
+    const recovered = collector.read(.{}, 5 * std.time.ns_per_s, true);
+    try expectApprox(25.0, recovered.cpu_usage, 1e-9);
+
+    // A retry that resolves to host must discard the failed container sample.
+    try tmp.dir.deleteFile(std.testing.io, "dockerenv");
+    try tmp.dir.deleteFile(std.testing.io, "docker/moved/cpu.stat");
+    try writeFile(tmp.dir, "proc/self/cgroup", "0::/init.scope\n");
+    try writeFile(tmp.dir, "proc/1/cgroup", "0::/init.scope\n");
+    const host = collector.read(.{}, 6 * std.time.ns_per_s, true);
+    try std.testing.expect(host.scope == .host);
+    try std.testing.expectEqualStrings("", host.message);
+}
+
+test "unreadable or invalid ancestor swap limits keep totals unknown" {
+    for ([_]bool{ false, true }) |v1| {
+        for ([_]bool{ false, true }) |unreadable| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = try rootOf(&tmp, &root_buf);
+            var paths = Paths{};
+            const sources = try paths.init(root);
+
+            const members = if (v1) "2:cpu,cpuacct,cpuset,memory:/docker/abc\n" else "0::/docker/abc\n";
+            try writeFile(tmp.dir, "proc/self/cgroup", members);
+            try writeFile(tmp.dir, "proc/1/cgroup", members);
+            try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 1048576 kB\n");
+            const ancestor_limit = if (v1) "memory.memsw.limit_in_bytes" else "memory.swap.max";
+            if (unreadable) {
+                try makeDir(tmp.dir, ancestor_limit);
+            } else {
+                try writeFile(tmp.dir, ancestor_limit, "invalid\n");
+            }
+            if (v1) {
+                try writeFile(tmp.dir, "docker/abc/cpu.cfs_quota_us", "200000\n");
+                try writeFile(tmp.dir, "docker/abc/cpu.cfs_period_us", "100000\n");
+                try writeFile(tmp.dir, "docker/abc/cpuset.effective_cpus", "0-1\n");
+                try writeFile(tmp.dir, "docker/abc/cpuacct.usage", "0\n");
+                try writeFile(tmp.dir, "docker/abc/memory.usage_in_bytes", "67108864\n");
+                try writeFile(tmp.dir, "docker/abc/memory.limit_in_bytes", "134217728\n");
+                try writeFile(tmp.dir, "docker/abc/memory.memsw.limit_in_bytes", "16384\n");
+                try writeFile(tmp.dir, "docker/abc/memory.stat", "total_inactive_file 0\ntotal_swap 4096\nhierarchical_memsw_limit 16384\n");
+                var mi_buf: [4096]u8 = undefined;
+                try writeFile(tmp.dir, "proc/self/mountinfo", try std.fmt.bufPrint(&mi_buf,
+                    "31 23 0:27 / {s} rw - cgroup cgroup rw,cpu,cpuacct,cpuset,memory\n", .{root}));
+            } else {
+                try writeFile(tmp.dir, "docker/abc/cpu.max", "200000 100000\n");
+                try writeFile(tmp.dir, "docker/abc/cpuset.cpus.effective", "0-1\n");
+                try writeFile(tmp.dir, "docker/abc/cpu.stat", "usage_usec 0\n");
+                try writeFile(tmp.dir, "docker/abc/memory.current", "67108864\n");
+                try writeFile(tmp.dir, "docker/abc/memory.max", "134217728\n");
+                try writeFile(tmp.dir, "docker/abc/memory.stat", "inactive_file 0\n");
+                try writeFile(tmp.dir, "docker/abc/memory.swap.current", "4096\n");
+                try writeFile(tmp.dir, "docker/abc/memory.swap.max", "16384\n");
+                try writeMountInfoV2(&tmp, root, "");
+            }
+
+            const collector = try newCollector(sources);
+            defer std.testing.allocator.destroy(collector);
+            const sample = collector.read(.{}, std.time.ns_per_s, true);
+            try std.testing.expect(sample.scope == .container);
+            try expectApprox(2.0, sample.cpu_capacity.?, 1e-9);
+            try std.testing.expectEqual(@as(u64, 134217728), sample.ram.total);
+            try std.testing.expectEqual(@as(u64, 67108864), sample.ram.used);
+            try std.testing.expectEqual(@as(u64, 4096), sample.swap.used);
+            try std.testing.expectEqual(@as(u64, 0), sample.swap.total);
+            try std.testing.expect(sample.swap_limit_kind == .unknown);
+            try std.testing.expectEqualStrings(msg_unavailable, sample.message);
+
+            // Invalid data must not become unlimited even without a finite leaf.
+            if (v1) {
+                try writeFile(tmp.dir, "docker/abc/memory.memsw.limit_in_bytes", "9223372036854771712\n");
+                try writeFile(tmp.dir, "docker/abc/memory.stat", "total_inactive_file 0\ntotal_swap 4096\n");
+                const unlimited_leaf = collector.read(.{}, std.time.ns_per_s, false);
+                try std.testing.expectEqual(@as(u64, 0), unlimited_leaf.swap.total);
+                try std.testing.expectEqual(@as(u64, 4096), unlimited_leaf.swap.used);
+                try std.testing.expect(unlimited_leaf.swap_limit_kind == .unknown);
+                try std.testing.expectEqualStrings(msg_unavailable, unlimited_leaf.message);
+            }
+
+            if (unreadable) try tmp.dir.deleteDir(std.testing.io, ancestor_limit);
+            try writeFile(tmp.dir, ancestor_limit, "8192\n");
+            const recovered = collector.read(.{}, 2 * std.time.ns_per_s, false);
+            try std.testing.expectEqual(@as(u64, 8192), recovered.swap.total);
+            try std.testing.expectEqual(@as(u64, 4096), recovered.swap.used);
+            const expected_kind: cgroup.SwapLimitKind = if (v1) .shared_memsw_upper_bound else .independent;
+            try std.testing.expect(recovered.swap_limit_kind == expected_kind);
+        }
+    }
+}
+
+test "auto distinguishes plain hosts from containers without cgroup mounts" {
+    const Clue = enum { host, marker, member, forced, explicit, disabled };
+    for ([_]bool{ false, true }) |mountinfo_missing| {
+        for ([_]Clue{ .host, .marker, .member, .forced, .explicit, .disabled }) |clue| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const root = try rootOf(&tmp, &root_buf);
+            var paths = Paths{};
+            const sources = try paths.init(root);
+
+            try writeFile(tmp.dir, "proc/1/comm", "systemd\n");
+            const members = switch (clue) {
+                .member => "0::/docker/abc\n",
+                .disabled => "",
+                else => "0::/init.scope\n",
+            };
+            try writeFile(tmp.dir, "proc/self/cgroup", members);
+            try writeFile(tmp.dir, "proc/1/cgroup", members);
+            try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 1048576 kB\n");
+            try writeFile(tmp.dir, "online", "0-39\n");
+            if (!mountinfo_missing) try writeFile(tmp.dir, "proc/self/mountinfo", "23 1 0:1 / / rw - ext4 /dev/root rw\n");
+            if (clue == .marker) try writeFile(tmp.dir, "dockerenv", "");
+
+            const collector = try newCollector(sources);
+            defer std.testing.allocator.destroy(collector);
+            const sample = collector.read(.{
+                .resource_mode = if (clue == .forced) "container" else "auto",
+                .cgroup_path = if (clue == .explicit) "/docker/abc" else "",
+            }, std.time.ns_per_s, true);
+            if (clue == .host or clue == .disabled) {
+                try std.testing.expect(sample.scope == .host);
+                try std.testing.expectEqualStrings("", sample.message);
+            } else {
+                try std.testing.expect(sample.scope == .unavailable);
+                try std.testing.expectEqualStrings(msg_unavailable, sample.message);
+            }
+            try std.testing.expect(sample.cpu_capacity == null);
+            try std.testing.expectEqual(@as(u32, 0), sample.cpu_cores);
+            try std.testing.expectEqual(@as(u64, 0), sample.ram.total);
+            try std.testing.expectEqual(@as(u64, 0), sample.swap.total);
+        }
+    }
+}
+
+test "missing or invalid CPU accounting is surfaced only for updating samples" {
+    for ([_]bool{ false, true }) |v1| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root = try rootOf(&tmp, &root_buf);
+        var paths = Paths{};
+        const sources = try paths.init(root);
+        const members = if (v1) "2:cpu,cpuacct,cpuset,memory:/\n" else "0::/\n";
+        try writeFile(tmp.dir, "dockerenv", "");
+        try writeFile(tmp.dir, "proc/self/cgroup", members);
+        try writeFile(tmp.dir, "proc/1/cgroup", members);
+        try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 0 kB\n");
+        if (v1) {
+            try writeFile(tmp.dir, "cpu.cfs_quota_us", "200000\n");
+            try writeFile(tmp.dir, "cpu.cfs_period_us", "100000\n");
+            try writeFile(tmp.dir, "cpuset.effective_cpus", "0-1\n");
+            try writeFile(tmp.dir, "memory.usage_in_bytes", "1048576\n");
+            try writeFile(tmp.dir, "memory.limit_in_bytes", "2147483648\n");
+            try writeFile(tmp.dir, "memory.stat", "total_inactive_file 0\ntotal_swap 0\n");
+            var mi_buf: [4096]u8 = undefined;
+            try writeFile(tmp.dir, "proc/self/mountinfo", try std.fmt.bufPrint(&mi_buf,
+                "31 23 0:27 / {s} rw - cgroup cgroup rw,cpu,cpuacct,cpuset,memory\n", .{root}));
+        } else {
+            try writeFile(tmp.dir, "cpu.max", "200000 100000\n");
+            try writeFile(tmp.dir, "cpuset.cpus.effective", "0-1\n");
+            try writeFile(tmp.dir, "memory.current", "1048576\n");
+            try writeFile(tmp.dir, "memory.max", "2147483648\n");
+            try writeFile(tmp.dir, "memory.stat", "inactive_file 0\n");
+            try writeFile(tmp.dir, "memory.swap.max", "0\n");
+            try writeFile(tmp.dir, "memory.swap.current", "0\n");
+            try writeMountInfoV2(&tmp, root, "");
+        }
+
+        const collector = try newCollector(sources);
+        defer std.testing.allocator.destroy(collector);
+        const counter_path = if (v1) "cpuacct.usage" else "cpu.stat";
+        const probe = collector.read(.{}, std.time.ns_per_s, false);
+        try std.testing.expectEqualStrings("", probe.message);
+        const missing = collector.read(.{}, 2 * std.time.ns_per_s, true);
+        try expectApprox(2.0, missing.cpu_capacity.?, 1e-9);
+        try expectApprox(0.001, missing.cpu_usage, 1e-9);
+        try std.testing.expectEqual(@as(u64, 1048576), missing.ram.used);
+        try std.testing.expectEqualStrings(msg_unavailable, missing.message);
+
+        try writeFile(tmp.dir, counter_path, if (v1) "invalid\n" else "usage_usec invalid\n");
+        const invalid = collector.read(.{}, 3 * std.time.ns_per_s, true);
+        try std.testing.expectEqualStrings(msg_unavailable, invalid.message);
+        const diagnostic = collector.read(.{}, 3 * std.time.ns_per_s, false);
+        try std.testing.expectEqualStrings("", diagnostic.message);
+
+        try writeFile(tmp.dir, counter_path, if (v1) "0\n" else "usage_usec 0\n");
+        const first = collector.read(.{}, 4 * std.time.ns_per_s, true);
+        try expectApprox(0.001, first.cpu_usage, 1e-9);
+        try std.testing.expectEqualStrings("", first.message);
+        try writeFile(tmp.dir, counter_path, if (v1) "1000000000\n" else "usage_usec 1000000\n");
+        const recovered = collector.read(.{}, 5 * std.time.ns_per_s, true);
+        try expectApprox(50.0, recovered.cpu_usage, 1e-9);
+    }
+}
+
+test "previously detected root-view container never becomes host on mount failure" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try rootOf(&tmp, &root_buf);
+    var paths = Paths{};
+    const sources = try paths.init(root);
+    try writeFile(tmp.dir, "proc/self/cgroup", "0::/\n");
+    try writeFile(tmp.dir, "proc/1/cgroup", "0::/init.scope\n");
+    try writeFile(tmp.dir, "proc/1/comm", "systemd\n");
+    try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 0 kB\n");
+    try writeFile(tmp.dir, "online", "0-39\n");
+    try writeFile(tmp.dir, "cpu.max", "100000 100000\n");
+    try writeFile(tmp.dir, "cpuset.cpus.effective", "0\n");
+    try writeFile(tmp.dir, "memory.current", "1048576\n");
+    try writeFile(tmp.dir, "memory.max", "2147483648\n");
+    try writeFile(tmp.dir, "memory.stat", "inactive_file 0\n");
+    try writeMountInfoV2(&tmp, root, "");
+
+    const collector = try newCollector(sources);
+    defer std.testing.allocator.destroy(collector);
+    const initial = collector.read(.{}, std.time.ns_per_s, false);
+    try std.testing.expect(initial.scope == .container);
+    try expectApprox(1.0, initial.cpu_capacity.?, 1e-9);
+    try tmp.dir.deleteFile(std.testing.io, "proc/self/mountinfo");
+    const failed = collector.read(.{}, 31 * std.time.ns_per_s, false);
+    try std.testing.expect(failed.scope == .unavailable);
+    try std.testing.expect(failed.cpu_capacity == null);
+    try std.testing.expectEqual(@as(u64, 0), failed.ram.total);
+    try std.testing.expectEqualStrings(msg_unavailable, failed.message);
+
+    // Recovery must not wait another TTL after a failed resolution.
+    try writeMountInfoV2(&tmp, root, "");
+    const recovered = collector.read(.{}, 32 * std.time.ns_per_s, false);
+    try std.testing.expect(recovered.scope == .container);
+    try expectApprox(1.0, recovered.cpu_capacity.?, 1e-9);
+    try std.testing.expectEqual(@as(u64, 2147483648), recovered.ram.total);
+    try std.testing.expectEqual(@as(?u64, 1048576), recovered.charged_memory);
+}
+
+test "shared PID namespaces use the agent container rather than PID 1" {
+    const Case = struct { self_member: []const u8, pid1_member: []const u8, target: []const u8, other: []const u8 };
+    const cases = [_]Case{
+        .{ .self_member = "/docker/agent/system.slice/komari-agent.service", .pid1_member = "/docker/sibling/init.scope", .target = "docker/agent", .other = "docker/sibling" },
+        .{ .self_member = "/docker/outer/docker/inner/system.slice/komari-agent.service", .pid1_member = "/docker/outer/init.scope", .target = "docker/outer/docker/inner", .other = "docker/outer" },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root = try rootOf(&tmp, &root_buf);
+        var paths = Paths{};
+        const sources = try paths.init(root);
+        var member_buf: [512]u8 = undefined;
+        try writeFile(tmp.dir, "proc/self/cgroup", try std.fmt.bufPrint(&member_buf, "0::{s}\n", .{case.self_member}));
+        try writeFile(tmp.dir, "proc/1/cgroup", try std.fmt.bufPrint(&member_buf, "0::{s}\n", .{case.pid1_member}));
+        try writeFile(tmp.dir, "proc/1/comm", "systemd\n");
+        try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 0 kB\n");
+        var path_buf: [512]u8 = undefined;
+        for ([_][]const u8{ case.target, case.other }, 0..) |dir, i| {
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/cpu.max", .{dir}), if (i == 0) "200000 100000\n" else "800000 100000\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/cpuset.cpus.effective", .{dir}), "0-7\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/memory.current", .{dir}), if (i == 0) "67108864\n" else "268435456\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/memory.max", .{dir}), if (i == 0) "134217728\n" else "536870912\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/memory.stat", .{dir}), "inactive_file 0\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/memory.swap.current", .{dir}), "0\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&path_buf, "{s}/memory.swap.max", .{dir}), "0\n");
+        }
+        try writeMountInfoV2(&tmp, root, "");
+        const collector = try newCollector(sources);
+        defer std.testing.allocator.destroy(collector);
+        const sample = collector.read(.{}, std.time.ns_per_s, false);
+        try std.testing.expect(sample.scope == .container);
+        try expectApprox(2.0, sample.cpu_capacity.?, 1e-9);
+        try std.testing.expectEqual(@as(u64, 134217728), sample.ram.total);
+        try std.testing.expectEqual(@as(u64, 67108864), sample.ram.used);
+    }
+}
+
+test "v1 swap fallback requires both memory and memsw usage" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try rootOf(&tmp, &root_buf);
+    var paths = Paths{};
+    const sources = try paths.init(root);
+    try writeFile(tmp.dir, "dockerenv", "");
+    try writeFile(tmp.dir, "proc/self/cgroup", "2:cpu,cpuacct,cpuset,memory:/\n");
+    try writeFile(tmp.dir, "proc/1/cgroup", "2:cpu,cpuacct,cpuset,memory:/\n");
+    try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 1048576 kB\n");
+    try writeFile(tmp.dir, "cpu.cfs_quota_us", "200000\n");
+    try writeFile(tmp.dir, "cpu.cfs_period_us", "100000\n");
+    try writeFile(tmp.dir, "cpuset.effective_cpus", "0-1\n");
+    try writeFile(tmp.dir, "memory.limit_in_bytes", "134217728\n");
+    try writeFile(tmp.dir, "memory.memsw.limit_in_bytes", "268435456\n");
+    try writeFile(tmp.dir, "memory.memsw.usage_in_bytes", "65536\n");
+    try writeFile(tmp.dir, "memory.stat", "total_inactive_file 0\nswap 8192\n");
+    var mi_buf: [4096]u8 = undefined;
+    try writeFile(tmp.dir, "proc/self/mountinfo", try std.fmt.bufPrint(&mi_buf,
+        "31 23 0:27 / {s} rw - cgroup cgroup rw,cpu,cpuacct,cpuset,memory\n", .{root}));
+    const collector = try newCollector(sources);
+    defer std.testing.allocator.destroy(collector);
+
+    const incomplete = collector.read(.{}, std.time.ns_per_s, false);
+    try std.testing.expectEqual(@as(u64, 0), incomplete.swap.used);
+    try std.testing.expectEqualStrings(msg_unavailable, incomplete.message);
+
+    // With both hierarchical counters the difference is a swap measurement.
+    try writeFile(tmp.dir, "memory.usage_in_bytes", "49152\n");
+    const recovered = collector.read(.{}, 2 * std.time.ns_per_s, false);
+    try std.testing.expectEqual(@as(u64, 16384), recovered.swap.used);
+    try std.testing.expectEqual(@as(u64, 49152), recovered.ram.used);
+    try std.testing.expectEqualStrings(msg_v1_swap, recovered.message);
+
+    // A local stat excludes descendants and is not a container-wide substitute.
+    try tmp.dir.deleteFile(std.testing.io, "memory.memsw.usage_in_bytes");
+    const local_only = collector.read(.{}, 3 * std.time.ns_per_s, false);
+    try std.testing.expectEqual(@as(u64, 0), local_only.swap.used);
+    try std.testing.expectEqualStrings(msg_unavailable, local_only.message);
+
+    try writeFile(tmp.dir, "memory.stat", "total_inactive_file 0\ntotal_swap 32768\nswap 8192\n");
+    const total_stat = collector.read(.{}, 4 * std.time.ns_per_s, false);
+    try std.testing.expectEqual(@as(u64, 32768), total_stat.swap.used);
+    try std.testing.expectEqualStrings(msg_v1_swap, total_stat.message);
+}
+
+test "failed or invalid cpusets never expand capacity to host online CPUs" {
+    const Kind = enum { v2, v1_effective, v1_configured };
+    for ([_]Kind{ .v2, .v1_effective, .v1_configured }) |kind| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root = try rootOf(&tmp, &root_buf);
+        var paths = Paths{};
+        const sources = try paths.init(root);
+        const members = if (kind == .v2) "0::/docker/abc\n" else "2:cpu,cpuacct,cpuset,memory:/docker/abc\n";
+        try writeFile(tmp.dir, "proc/self/cgroup", members);
+        try writeFile(tmp.dir, "proc/1/cgroup", members);
+        try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 0 kB\n");
+        try writeFile(tmp.dir, "online", "0-7\n");
+        const set_path = switch (kind) {
+            .v2 => "docker/abc/cpuset.cpus.effective",
+            .v1_effective => "docker/abc/cpuset.effective_cpus",
+            .v1_configured => "cpuset.cpus",
+        };
+        if (kind == .v2) {
+            try writeFile(tmp.dir, "docker/abc/cpu.max", "800000 100000\n");
+            try writeFile(tmp.dir, "docker/abc/memory.current", "67108864\n");
+            try writeFile(tmp.dir, "docker/abc/memory.max", "134217728\n");
+            try writeFile(tmp.dir, "docker/abc/memory.stat", "inactive_file 0\n");
+            try writeFile(tmp.dir, "docker/abc/memory.swap.current", "0\n");
+            try writeFile(tmp.dir, "docker/abc/memory.swap.max", "0\n");
+            try writeMountInfoV2(&tmp, root, "");
+        } else {
+            try writeFile(tmp.dir, "docker/abc/cpu.cfs_quota_us", "800000\n");
+            try writeFile(tmp.dir, "docker/abc/cpu.cfs_period_us", "100000\n");
+            try writeFile(tmp.dir, "docker/abc/memory.usage_in_bytes", "67108864\n");
+            try writeFile(tmp.dir, "docker/abc/memory.limit_in_bytes", "134217728\n");
+            try writeFile(tmp.dir, "docker/abc/memory.stat", "total_inactive_file 0\ntotal_swap 0\n");
+            if (kind == .v1_configured) try writeFile(tmp.dir, "docker/abc/cpuset.cpus", "\n");
+            var mi_buf: [4096]u8 = undefined;
+            try writeFile(tmp.dir, "proc/self/mountinfo", try std.fmt.bufPrint(&mi_buf,
+                "31 23 0:27 / {s} rw - cgroup cgroup rw,cpu,cpuacct,cpuset,memory\n", .{root}));
+        }
+        try writeFile(tmp.dir, set_path, "0-1\n");
+        const collector = try newCollector(sources);
+        defer std.testing.allocator.destroy(collector);
+        const initial = collector.read(.{}, std.time.ns_per_s, false);
+        try expectApprox(2.0, initial.cpu_capacity.?, 1e-9);
+
+        // A directory, invalid data, and a full buffer all mean unknown, not 8.
+        try tmp.dir.deleteFile(std.testing.io, set_path);
+        try makeDir(tmp.dir, set_path);
+        const unreadable = collector.read(.{}, 2 * std.time.ns_per_s, false);
+        try std.testing.expect(unreadable.cpu_capacity == null);
+        try std.testing.expectEqual(@as(u32, 0), unreadable.cpu_cores);
+        try std.testing.expectEqual(@as(u64, 134217728), unreadable.ram.total);
+        try std.testing.expectEqualStrings(msg_unavailable, unreadable.message);
+        try tmp.dir.deleteDir(std.testing.io, set_path);
+        try writeFile(tmp.dir, set_path, "1-0\n");
+        const invalid = collector.read(.{}, 3 * std.time.ns_per_s, false);
+        try std.testing.expect(invalid.cpu_capacity == null);
+        try std.testing.expectEqualStrings(msg_unavailable, invalid.message);
+        var oversized: [cgroup.list_bytes]u8 = undefined;
+        @memset(&oversized, '0');
+        const read_limit = if (kind == .v1_configured) cgroup.list_bytes else cgroup.scalar_bytes;
+        try writeFile(tmp.dir, set_path, oversized[0..read_limit]);
+        const truncated = collector.read(.{}, 4 * std.time.ns_per_s, false);
+        try std.testing.expect(truncated.cpu_capacity == null);
+        try std.testing.expectEqualStrings(msg_unavailable, truncated.message);
+
+        try writeFile(tmp.dir, set_path, "0-1\n");
+        const recovered = collector.read(.{}, 5 * std.time.ns_per_s, false);
+        try expectApprox(2.0, recovered.cpu_capacity.?, 1e-9);
+        try std.testing.expectEqualStrings("", recovered.message);
+
+        // A genuinely absent controller interface retains the online fallback.
+        try tmp.dir.deleteFile(std.testing.io, set_path);
+        const absent = collector.read(.{}, 6 * std.time.ns_per_s, false);
+        try expectApprox(8.0, absent.cpu_capacity.?, 1e-9);
+    }
+}
+
+test "detected root-view container remains container when limits become unlimited" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root = try rootOf(&tmp, &root_buf);
+    var paths = Paths{};
+    const sources = try paths.init(root);
+    try writeFile(tmp.dir, "proc/self/cgroup", "0::/\n");
+    try writeFile(tmp.dir, "proc/1/cgroup", "0::/init.scope\n");
+    try writeFile(tmp.dir, "proc/1/comm", "systemd\n");
+    try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 131072 kB\nSwapTotal: 0 kB\n");
+    try writeFile(tmp.dir, "online", "0-7\n");
+    try writeFile(tmp.dir, "cpu.max", "100000 100000\n");
+    try writeFile(tmp.dir, "cpuset.cpus.effective", "0-1\n");
+    try writeFile(tmp.dir, "memory.current", "1048576\n");
+    try writeFile(tmp.dir, "memory.max", "max\n");
+    try writeFile(tmp.dir, "memory.stat", "inactive_file 0\n");
+    try writeFile(tmp.dir, "memory.swap.current", "0\n");
+    try writeFile(tmp.dir, "memory.swap.max", "0\n");
+    try writeMountInfoV2(&tmp, root, "");
+    const collector = try newCollector(sources);
+    defer std.testing.allocator.destroy(collector);
+
+    const initial = collector.read(.{}, std.time.ns_per_s, false);
+    try std.testing.expect(initial.scope == .container);
+    try expectApprox(1.0, initial.cpu_capacity.?, 1e-9);
+    try writeFile(tmp.dir, "cpu.max", "max 100000\n");
+    const unlimited = collector.read(.{}, 31 * std.time.ns_per_s, false);
+    try std.testing.expect(unlimited.scope == .container);
+    try expectApprox(2.0, unlimited.cpu_capacity.?, 1e-9);
+    try std.testing.expectEqual(@as(u64, 134217728), unlimited.ram.total);
+    try std.testing.expectEqual(@as(u64, 1048576), unlimited.ram.used);
+
+    // A fresh unknown root still uses auto detection, and explicit host wins.
+    const fresh = try newCollector(sources);
+    defer std.testing.allocator.destroy(fresh);
+    try std.testing.expect(fresh.read(.{}, 32 * std.time.ns_per_s, false).scope == .host);
+    try std.testing.expect(collector.read(.{ .resource_mode = "host" }, 32 * std.time.ns_per_s, false).scope == .host);
+    try std.testing.expect(collector.read(.{}, 33 * std.time.ns_per_s, false).scope == .host);
+}
+
+test "absent proc cgroup files identify a disabled kernel without masking failures" {
+    const Case = enum { host, marker, forced, failed };
+    for ([_]Case{ .host, .marker, .forced, .failed }) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root = try rootOf(&tmp, &root_buf);
+        var paths = Paths{};
+        const sources = try paths.init(root);
+        try writeFile(tmp.dir, "proc/1/comm", "systemd\n");
+        try writeFile(tmp.dir, "proc/self/mountinfo", "23 1 0:1 / / rw - ext4 /dev/root rw\n");
+        if (case == .marker) try writeFile(tmp.dir, "dockerenv", "");
+        if (case == .failed) {
+            try makeDir(tmp.dir, "proc/self/cgroup");
+            try makeDir(tmp.dir, "proc/1/cgroup");
+        }
+        const collector = try newCollector(sources);
+        defer std.testing.allocator.destroy(collector);
+        const sample = collector.read(.{
+            .resource_mode = if (case == .forced) "container" else "auto",
+        }, std.time.ns_per_s, true);
+        if (case == .host) {
+            try std.testing.expect(sample.scope == .host);
+            try std.testing.expectEqualStrings("", sample.message);
+        } else {
+            try std.testing.expect(sample.scope == .unavailable);
+            try std.testing.expectEqualStrings(msg_unavailable, sample.message);
+        }
+        try std.testing.expectEqual(@as(u32, 0), sample.cpu_cores);
+        try std.testing.expectEqual(@as(u64, 0), sample.ram.total);
+    }
+}
+
+test "namespace parent memberships never escape the cgroup mount" {
+    const Case = struct { self: []const u8, pid1: []const u8, available: bool };
+    const cases = [_]Case{
+        .{ .self = "/", .pid1 = "/..", .available = true },
+        .{ .self = "/", .pid1 = "/../docker/sibling", .available = true },
+        .{ .self = "/../docker/sibling", .pid1 = "/", .available = false },
+    };
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var root_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const root = try rootOf(&tmp, &root_buf);
+        var paths = Paths{};
+        const sources = try paths.init(root);
+        var buf: [4096]u8 = undefined;
+        try writeFile(tmp.dir, "proc/self/cgroup", try std.fmt.bufPrint(&buf, "0::{s}\n", .{case.self}));
+        try writeFile(tmp.dir, "proc/1/cgroup", try std.fmt.bufPrint(&buf, "0::{s}\n", .{case.pid1}));
+        try writeFile(tmp.dir, "proc/meminfo", "MemTotal: 16777216 kB\nSwapTotal: 0 kB\n");
+        try writeFile(tmp.dir, "online", "0-7\n");
+        // The sibling has readable data outside the fake mount. Merely
+        // concatenating /../docker/sibling would expose its larger limits.
+        for ([_][]const u8{ "cg2", "docker/sibling" }, 0..) |dir, i| {
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/cpu.max", .{dir}), if (i == 0) "200000 100000\n" else "800000 100000\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/cpuset.cpus.effective", .{dir}), "0-7\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/memory.current", .{dir}), if (i == 0) "67108864\n" else "268435456\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/memory.max", .{dir}), if (i == 0) "134217728\n" else "536870912\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/memory.stat", .{dir}), "inactive_file 0\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/memory.swap.current", .{dir}), "0\n");
+            try writeFile(tmp.dir, try std.fmt.bufPrint(&buf, "{s}/memory.swap.max", .{dir}), "0\n");
+        }
+        const mountpoint = try std.fmt.bufPrint(&buf, "{s}/cg2", .{root});
+        try writeMountInfoV2(&tmp, mountpoint, "");
+        const collector = try newCollector(sources);
+        defer std.testing.allocator.destroy(collector);
+        const sample = collector.read(.{ .resource_mode = "container" }, std.time.ns_per_s, false);
+        if (case.available) {
+            try std.testing.expect(sample.scope == .container);
+            try expectApprox(2.0, sample.cpu_capacity.?, 1e-9);
+            try std.testing.expectEqual(@as(u64, 134217728), sample.ram.total);
+            try std.testing.expectEqual(@as(u64, 67108864), sample.ram.used);
+        } else {
+            try std.testing.expect(sample.scope == .unavailable);
+            try std.testing.expect(sample.cpu_capacity == null);
+            try std.testing.expectEqual(@as(u64, 0), sample.ram.total);
+            try std.testing.expectEqualStrings(msg_unavailable, sample.message);
+        }
+    }
 }

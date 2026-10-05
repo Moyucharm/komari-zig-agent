@@ -626,15 +626,35 @@ fn stripInitScope(path: []const u8) []const u8 {
     return path;
 }
 
-/// Pick the cgroup membership path that represents the whole container.
-/// Prefers the PID 1 boundary, falls back to the agent process path when PID 1
-/// is not an ancestor. Returns null when the relationship cannot be explained.
-fn boundaryMember(self_path: []const u8, pid1_path: ?[]const u8, pid1_is_systemd: bool) ?[]const u8 {
-    var candidate = pid1_path orelse self_path;
-    if (pid1_path != null and pid1_is_systemd) candidate = stripInitScope(candidate);
+/// Kernel membership paths use `..` for processes outside this cgroup
+/// namespace. They cannot be resolved beneath its mounted root.
+fn outsideNamespace(path: []const u8) bool {
+    var segments = std.mem.tokenizeScalar(u8, path, '/');
+    while (segments.next()) |segment| {
+        if (std.mem.eql(u8, segment, "..")) return true;
+    }
+    return false;
+}
 
-    if (containerBoundary(candidate)) |boundary| return boundary;
+/// Pick the cgroup membership path that represents the whole container.
+/// The agent's innermost container boundary wins over PID 1, which may belong
+/// to a sibling or outer container in a shared PID namespace.
+fn boundaryMember(self_path: []const u8, pid1_path: ?[]const u8, pid1_is_systemd: bool) ?[]const u8 {
+    if (outsideNamespace(self_path)) return null;
+    const usable_pid1: ?[]const u8 = if (pid1_path) |path|
+        if (outsideNamespace(path)) null else path
+    else
+        null;
+    if (self_path.len == 0 and usable_pid1 == null) return null;
     if (containerBoundary(self_path)) |boundary| return boundary;
+    var candidate = usable_pid1 orelse self_path;
+    if (usable_pid1 != null and pid1_is_systemd) candidate = stripInitScope(candidate);
+
+    if (containerBoundary(candidate)) |boundary| {
+        if (self_path.len == 0 or isSegmentAncestor(boundary, self_path)) return boundary;
+        return null;
+    }
+    if (self_path.len == 0) return if (candidate.len == 0) "/" else candidate;
     if (std.mem.eql(u8, candidate, "/") or candidate.len == 0) return "/";
     if (isSegmentAncestor(candidate, self_path)) return candidate;
     return null;
@@ -714,6 +734,7 @@ const CpuResult = struct {
     capacity: ?f64 = null,
     cores: u32 = 0,
     usage: f64 = cpu_report_floor,
+    accounting_missing: bool = false,
     quota_source: []const u8 = "unknown",
     cpuset_source: []const u8 = "unknown",
     accounting_source: []const u8 = "unknown",
@@ -797,7 +818,9 @@ pub const Collector = struct {
         if (self.targets[Controller.memory.index()].version != .none) {
             try writer.print("Memory target: {s} {s}\n", .{ @tagName(self.targets[Controller.memory.index()].version), self.targets[Controller.memory.index()].slice() });
         }
-        if (self.missing.cpu) try writer.writeAll("Missing: CPU capacity\n");
+        if (self.missing.cpu) {
+            try writer.writeAll(if (self.last.cpu_capacity == null) "Missing: CPU capacity\n" else "Missing: CPU accounting\n");
+        }
         if (self.missing.ram) try writer.writeAll("Missing: RAM accounting\n");
         if (self.missing.swap) try writer.writeAll("Missing: swap accounting\n");
         if (self.missing.cache_stats) try writer.writeAll("Degraded: memory cache statistics\n");
@@ -834,12 +857,18 @@ pub const Collector = struct {
             return self.last;
         }
 
+        const previous_baseline = self.cpu_baseline;
         var sample = self.collect(options, now_ns, update_cpu_sample);
         if (self.locate_failed and was_cached) {
             // A required control file disappeared or turned unreadable: drop the
             // cached location and relocate exactly once.
+            // The discarded pass must not consume the reporting baseline.
+            self.cpu_baseline = previous_baseline;
             self.locate(options, now_ns, key);
-            if (self.scope != .host) sample = self.collect(options, now_ns, update_cpu_sample);
+            sample = if (self.scope == .host)
+                .{ .scope = .host }
+            else
+                self.collect(options, now_ns, update_cpu_sample);
         }
         self.last = sample;
         // Diagnostics must describe what was actually reported: a container
@@ -849,6 +878,7 @@ pub const Collector = struct {
     }
 
     fn locate(self: *Collector, options: common.SnapshotOptions, now_ns: i128, key: OptionKey) void {
+        const previous_hint = if (self.located and OptionKey.eql(self.option_key, key)) self.hint else "";
         self.located = true;
         self.located_ns = now_ns;
         self.option_key = key;
@@ -860,38 +890,43 @@ pub const Collector = struct {
         for (&self.targets) |*target| target.* = .{};
 
         var path_buf: [max_path]u8 = undefined;
-        const mountinfo_path = joinPath(&path_buf, self.sources.proc_root, "/self/mountinfo") orelse {
-            self.locate_failed = true;
-            self.scope = .unavailable;
-            return;
-        };
-        const mountinfo = switch (readBounded(mountinfo_path, &self.scratch.mountinfo)) {
-            .ok => |bytes| bytes,
-            else => {
-                self.locate_failed = true;
-                self.scope = .unavailable;
-                return;
-            },
-        };
-        self.mount_count = parseMountInfo(mountinfo, &self.mounts);
-        if (self.mount_count == 0) {
-            self.locate_failed = true;
-            self.scope = .unavailable;
-            return;
+        var mountinfo_readable = false;
+        if (joinPath(&path_buf, self.sources.proc_root, "/self/mountinfo")) |mountinfo_path| {
+            switch (readBounded(mountinfo_path, &self.scratch.mountinfo)) {
+                .ok => |bytes| {
+                    mountinfo_readable = true;
+                    self.mount_count = parseMountInfo(bytes, &self.mounts);
+                },
+                else => {},
+            }
         }
 
         var self_members = Members{};
         var pid1_members = Members{};
-        const self_path = joinPath(&path_buf, self.sources.proc_root, "/self/cgroup") orelse return;
-        switch (readBounded(self_path, &self.scratch.self_cgroup)) {
-            .ok => |bytes| parseMembers(bytes, &self_members),
-            else => {},
+        var self_readable = false;
+        var self_missing = false;
+        if (joinPath(&path_buf, self.sources.proc_root, "/self/cgroup")) |self_path| {
+            switch (readBounded(self_path, &self.scratch.self_cgroup)) {
+                .ok => |bytes| {
+                    self_readable = true;
+                    parseMembers(bytes, &self_members);
+                },
+                .missing => self_missing = true,
+                .failed => {},
+            }
         }
+        var pid1_readable = false;
+        var pid1_missing = false;
         var pid1_path_buf: [max_path]u8 = undefined;
-        const pid1_path = joinPath(&pid1_path_buf, self.sources.proc_root, "/1/cgroup") orelse return;
-        switch (readBounded(pid1_path, &self.scratch.pid1_cgroup)) {
-            .ok => |bytes| parseMembers(bytes, &pid1_members),
-            else => {},
+        if (joinPath(&pid1_path_buf, self.sources.proc_root, "/1/cgroup")) |pid1_path| {
+            switch (readBounded(pid1_path, &self.scratch.pid1_cgroup)) {
+                .ok => |bytes| {
+                    pid1_readable = true;
+                    parseMembers(bytes, &pid1_members);
+                },
+                .missing => pid1_missing = true,
+                .failed => {},
+            }
         }
 
         const pid1_is_systemd = blk: {
@@ -907,9 +942,35 @@ pub const Collector = struct {
         const forced = std.mem.eql(u8, options.resource_mode, "container") or explicit;
         if (!forced) {
             if (!self.detectHints(&self_members, &pid1_members, &path_buf)) {
-                self.scope = .host;
-                return;
+                // Removing limits does not turn an already identified root-view
+                // container into a host. A changed option key clears this hint.
+                const keep_root_scope = previous_hint.len != 0 and
+                    (if (self_members.v2) |member| std.mem.eql(u8, member, "/") else false);
+                if (keep_root_scope) {
+                    self.hint = previous_hint;
+                } else {
+                    if (self.mount_count == 0) {
+                        // A kernel built without cgroups omits the membership
+                        // files. Distinguish that from failed/denied reads, and
+                        // never erase previously identified container scope.
+                        const host_metadata = (self_readable and pid1_readable and
+                            (mountinfo_readable or pid1_is_systemd)) or
+                            (mountinfo_readable and self_missing and pid1_missing);
+                        if (!host_metadata or previous_hint.len != 0) {
+                            self.hint = previous_hint;
+                            self.locate_failed = true;
+                            self.scope = .unavailable;
+                        }
+                    }
+                    return;
+                }
             }
+        }
+
+        if (self.mount_count == 0) {
+            self.locate_failed = true;
+            self.scope = .unavailable;
+            return;
         }
 
         if (!self.locateTargets(options, &self_members, &pid1_members, pid1_is_systemd)) {
@@ -1081,8 +1142,10 @@ pub const Collector = struct {
         now_ns: i128,
         update_cpu_sample: bool,
     ) ResourceSample {
-        self.locate_failed = false;
+        // Preserve failed mount resolution so the next cached read can retry.
+        self.locate_failed = self.mount_count == 0;
         self.missing = .{};
+        self.diag.notes = .{};
 
         const cpu = self.sampleCpu(now_ns, update_cpu_sample);
         const ram = self.sampleRam(options);
@@ -1097,7 +1160,7 @@ pub const Collector = struct {
         self.diag.swap_total_known = swap.total_known;
         self.diag.mode = .container;
 
-        self.missing.cpu = cpu.capacity == null;
+        self.missing.cpu = cpu.capacity == null or cpu.accounting_missing;
         self.missing.ram = !ram.total_known or ram.charged == null;
         self.missing.swap = !swap.total_known or swap.used == null;
         self.missing.cache_stats = !ram.cache_stats;
@@ -1131,6 +1194,11 @@ pub const Collector = struct {
         var result = CpuResult{};
         const cpu_target = &self.targets[Controller.cpu.index()];
         const cpuset_target = &self.targets[Controller.cpuset.index()];
+        // No resolved CPU controller means no container capacity to report.
+        if (cpu_target.version == .none and cpuset_target.version == .none and
+            self.targets[Controller.cpuacct.index()].version == .none) return result;
+        if (cpu_target.version == .none and cpuset_target.version == .none and
+            !self.targetExists(&self.targets[Controller.cpuacct.index()])) return result;
 
         var quota_unknown = false;
         var quota: ?f64 = null;
@@ -1162,7 +1230,9 @@ pub const Collector = struct {
 
         if (!update_cpu_sample) return result;
 
+        result.accounting_missing = true;
         const counter = self.readCpuCounter(&result) orelse return result;
+        result.accounting_missing = false;
         result.usage = self.cpuUsage(counter, capacity.?, now_ns);
         return result;
     }
@@ -1269,7 +1339,6 @@ pub const Collector = struct {
     }
 
     fn quotaV1(self: *Collector, target: *const Target, unknown: *bool) ?f64 {
-        _ = self;
         var best: ?f64 = null;
         var it = AncestorIter{ .dir = target.slice(), .base_len = target.base_len };
         var path_buf: [max_path]u8 = undefined;
@@ -1284,7 +1353,13 @@ pub const Collector = struct {
             var period_buf: [64]u8 = undefined;
             const quota_bytes = switch (readBounded(quota_path, &quota_buf)) {
                 .ok => |bytes| bytes,
-                .missing => continue,
+                .missing => {
+                    if (std.mem.eql(u8, dir, target.slice()) and !self.targetExists(target)) {
+                        unknown.* = true;
+                        return best;
+                    }
+                    continue;
+                },
                 .failed => {
                     unknown.* = true;
                     return best;
@@ -1311,33 +1386,33 @@ pub const Collector = struct {
         return best;
     }
 
-    /// CPU set size for capacity. Returns `maxInt(u32)` when the set is unknown
-    /// and must fall back to the online CPU list, and 0 when the set is
-    /// explicitly empty (capacity unknown, never patched from the host).
+    /// CPU set size for capacity. `maxInt(u32)` is unknown, and 0 is an
+    /// explicitly empty effective set. Neither is patched from host CPUs;
+    /// online fallback applies only when the cgroup interface is absent.
     fn runnableCpus(self: *Collector, target: *const Target, source: *[]const u8) u32 {
         var path_buf: [max_path]u8 = undefined;
         if (target.version == .v2) {
-            const path = joinPath(&path_buf, target.slice(), "/cpuset.cpus.effective") orelse return self.onlineCpus(source);
+            const path = joinPath(&path_buf, target.slice(), "/cpuset.cpus.effective") orelse return std.math.maxInt(u32);
             switch (readBounded(path, &self.scratch.small)) {
                 .ok => |bytes| {
-                    const count = parseCpuSet(bytes) catch return self.onlineCpus(source);
+                    const count = parseCpuSet(bytes) catch return std.math.maxInt(u32);
                     source.* = cgroupLabel("v2", "cpuset.cpus.effective");
                     return count;
                 },
-                .missing => return self.onlineCpus(source),
-                .failed => return self.onlineCpus(source),
+                .missing => return if (self.targetExists(target)) self.onlineCpus(source) else std.math.maxInt(u32),
+                .failed => return std.math.maxInt(u32),
             }
         }
         if (target.version == .v1) {
-            const effective = joinPath(&path_buf, target.slice(), "/cpuset.effective_cpus") orelse return self.onlineCpus(source);
+            const effective = joinPath(&path_buf, target.slice(), "/cpuset.effective_cpus") orelse return std.math.maxInt(u32);
             switch (readBounded(effective, &self.scratch.small)) {
                 .ok => |bytes| {
-                    const count = parseCpuSet(bytes) catch return self.onlineCpus(source);
+                    const count = parseCpuSet(bytes) catch return std.math.maxInt(u32);
                     source.* = cgroupLabel("v1", "cpuset.effective_cpus");
                     return count;
                 },
-                .missing => return self.v1ConfiguredCpus(target, source),
-                .failed => return self.onlineCpus(source),
+                .missing => return if (self.targetExists(target)) self.v1ConfiguredCpus(target, source) else std.math.maxInt(u32),
+                .failed => return std.math.maxInt(u32),
             }
         }
         return self.onlineCpus(source);
@@ -1353,10 +1428,10 @@ pub const Collector = struct {
         var it = AncestorIter{ .dir = target.slice(), .base_len = target.base_len };
         var path_buf: [max_path]u8 = undefined;
         while (it.next()) |dir| {
-            const path = joinPath(&path_buf, dir, "/cpuset.cpus") orelse break;
+            const path = joinPath(&path_buf, dir, "/cpuset.cpus") orelse return std.math.maxInt(u32);
             switch (readBounded(path, &self.scratch.list)) {
                 .ok => |bytes| {
-                    const count = parseCpuRanges(bytes, &inherited_buf) catch return self.onlineCpus(source);
+                    const count = parseCpuRanges(bytes, &inherited_buf) catch return std.math.maxInt(u32);
                     if (count != 0) {
                         inherited_count = count;
                         source.* = cgroupLabel("v1", "cpuset.cpus");
@@ -1364,7 +1439,7 @@ pub const Collector = struct {
                     }
                 },
                 .missing => {},
-                .failed => return self.onlineCpus(source),
+                .failed => return std.math.maxInt(u32),
             }
         }
         if (inherited_count == 0) return self.onlineCpus(source);
@@ -1568,6 +1643,17 @@ pub const Collector = struct {
         return result;
     }
 
+    /// A missing optional controller file permits fallback only while its
+    /// cgroup directory still exists. Check on failure paths, not every read.
+    fn targetExists(self: *Collector, target: *const Target) bool {
+        const dir = compat.openDir(target.slice(), .{}) catch {
+            self.locate_failed = true;
+            return false;
+        };
+        dir.close(std.Options.debug_io);
+        return true;
+    }
+
     fn sampleSwap(self: *Collector) SwapResult {
         var result = SwapResult{};
         const target = &self.targets[Controller.memory.index()];
@@ -1593,7 +1679,10 @@ pub const Collector = struct {
                     const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
                     result.used = std.fmt.parseInt(u64, trimmed, 10) catch null;
                 },
-                .missing => result.used = 0,
+                .missing => {
+                    if (!self.targetExists(target)) return result;
+                    result.used = 0;
+                },
                 .failed => {},
             }
 
@@ -1618,7 +1707,12 @@ pub const Collector = struct {
                 }
             }
 
-            if (limit) |bytes_limit| {
+            const effective_limit: ?u64 = if (limit_unknown) null else limit;
+            if (limit_unknown) {
+                result.kind = .unknown;
+                self.diag.notes.add("memory.swap.max is unreadable; swap total left unknown");
+            }
+            if (effective_limit) |bytes_limit| {
                 result.total = if (proc_swap_total) |phys| @min(bytes_limit, phys) else bytes_limit;
                 result.total_known = true;
             } else if (!limit_unknown) {
@@ -1626,14 +1720,12 @@ pub const Collector = struct {
                     result.total = phys;
                     result.total_known = true;
                 }
-            } else {
-                self.diag.notes.add("memory.swap.max is unreadable; swap total left unknown");
             }
             if (result.used) |used| {
                 if (proc_swap_total != null and proc_swap_total.? == 0 and used > 0) {
                     // Keep the cgroup-visible usage; never mask it with a zero
                     // host swap view.
-                    if (limit == null) result.total_known = false;
+                    if (effective_limit == null) result.total_known = false;
                 }
             }
             return result;
@@ -1662,11 +1754,11 @@ pub const Collector = struct {
                 .ok => |bytes| {
                     stat_available = true;
                     result.used = statValue(bytes, "total_swap");
-                    if (result.used == null) result.used = statValue(bytes, "swap");
                 },
                 else => {},
             }
         }
+        var incomplete_memsw_usage = false;
         if (result.used == null) {
             const memsw_usage_path = joinPath(&path_buf, target.slice(), "/memory.memsw.usage_in_bytes") orelse "";
             var memsw_used: ?u64 = null;
@@ -1689,11 +1781,17 @@ pub const Collector = struct {
                 }
             }
             if (memsw_used) |total_used| {
-                result.used = if (mem_used) |memory_used| total_used -| memory_used else total_used;
-                result.source = cgroupLabel("v1", "memory.memsw.usage_in_bytes");
+                if (mem_used) |memory_used| {
+                    result.used = total_used -| memory_used;
+                    result.source = cgroupLabel("v1", "memory.memsw.usage_in_bytes");
+                } else {
+                    incomplete_memsw_usage = true;
+                    self.diag.notes.add("memory.memsw usage includes RAM; swap usage left unknown without memory usage");
+                }
             }
         }
-        if (result.used == null and proc_swap_total != null and proc_swap_total.? == 0) {
+        if (result.used == null and !self.targetExists(target)) return result;
+        if (result.used == null and !incomplete_memsw_usage and proc_swap_total != null and proc_swap_total.? == 0) {
             result.used = 0;
         }
 
@@ -1712,8 +1810,12 @@ pub const Collector = struct {
             const path = joinPath(&path_buf, dir, "/memory.memsw.limit_in_bytes") orelse break;
             switch (readBounded(path, &self.scratch.small)) {
                 .ok => |bytes| {
-                    if (parseMemoryLimit(bytes, .v1) catch null) |value| {
-                        memsw_limit = if (memsw_limit) |current| @min(current, value) else value;
+                    const value = parseMemoryLimit(bytes, .v1) catch {
+                        memsw_unknown = true;
+                        break;
+                    };
+                    if (value) |bytes_limit| {
+                        memsw_limit = if (memsw_limit) |current| @min(current, bytes_limit) else bytes_limit;
                     }
                 },
                 .missing => {},
@@ -1724,7 +1826,8 @@ pub const Collector = struct {
             }
         }
 
-        if (memsw_limit) |bytes_limit| {
+        const effective_memsw_limit: ?u64 = if (memsw_unknown) null else memsw_limit;
+        if (effective_memsw_limit) |bytes_limit| {
             result.kind = .shared_memsw_upper_bound;
             result.total = if (proc_swap_total) |phys| @min(bytes_limit, phys) else bytes_limit;
             result.total_known = true;
