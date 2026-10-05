@@ -46,10 +46,11 @@ test "self update github proxy urls do not include closed mirrors" {
     try std.testing.expectEqualStrings("https://gh.example.com/https://api.github.com/repos/o/r/releases/latest", api_url);
 }
 
-test "self update release api override helper duplicates value" {
-    const url = try update.releaseApiUrlFromEnvValueForTest(std.testing.allocator, "http://127.0.0.1/release/latest");
+test "self update queries this fork release endpoint instead of upstream" {
+    const url = try update.releaseApiUrlForTest(std.testing.allocator);
     defer std.testing.allocator.free(url);
-    try std.testing.expectEqualStrings("http://127.0.0.1/release/latest", url);
+    try std.testing.expectEqualStrings("https://api.github.com/repos/Moyucharm/komari-zig-agent/releases/latest", url);
+    try std.testing.expect(std.mem.indexOf(u8, url, "luodaoyi/") == null);
 }
 
 test "self update identifies github release asset urls" {

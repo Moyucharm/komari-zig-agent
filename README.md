@@ -39,8 +39,8 @@ Zig 版 `komari-agent`，目标是直接替换原 Go agent，并保持 Komari �
 - Zig：0.16.0。
 - 服务端原项目：`komari-monitor/komari`，仓库地址 <https://github.com/komari-monitor/komari>。
 - Agent 兼容目标：`komari-monitor/komari-agent` 协议，原 Agent 仓库 <https://github.com/komari-monitor/komari-agent>。
-- 发布仓库：`luodaoyi/komari-zig-agent`。
-- 自更新：检查本仓库 GitHub Release，不再下载原 Go 仓库版本。
+- 本仓库 / 自更新发布源：`Moyucharm/komari-zig-agent`。
+- 自更新：只检查本仓库 GitHub Release，避免上游 Zig 仓库的 Release 覆盖定制二进制；不下载原 Go 仓库版本。
 
 ## 相较官方 Go Agent 的优势
 
@@ -101,8 +101,14 @@ curl -fsSL https://cdn.jsdelivr.net/gh/luodaoyi/komari-zig-agent@bd2e0b8de76a116
 自更新默认开启；配置了 endpoint 和 token 的正常启动会立即检查，此后每 6 小时检查一次。未确认的新版本会跳过启动检查，并暂缓定时检查。检查地址：
 
 ```text
-https://api.github.com/repos/luodaoyi/komari-zig-agent/releases/latest
+https://api.github.com/repos/Moyucharm/komari-zig-agent/releases/latest
 ```
+
+默认仓库由 `src/version.zig` 的硬编码常量 `repo` 定义，已从上游 `luodaoyi/komari-zig-agent` 改为本仓库 `Moyucharm/komari-zig-agent`。这是更新源切换，不是关闭自动更新：默认检查不再查询上游，因此上游发布更高版本也不会通过这条路径覆盖我们的定制二进制。
+
+本仓库当前尚无 Release，因此暂时不会自动替换二进制；检查仍会执行，无 Release 时可能记录检查失败，代理重试也使用同一个本仓库端点，不会回退到上游仓库。以后本仓库发布版本更高、含匹配平台资产及有效 SHA256 校验信息的 Release 后，会在后续检查时正常更新到我们的改版，无需再改代码。
+
+`KOMARI_RELEASE_API_URL` 的覆盖能力保留：未设置或为空时使用上述默认端点，非空时使用指定地址。若人为将它指向上游，就不再具备默认更新源的隔离效果；部署时应移除旧的上游覆盖值。此修复需重新编译并部署才能改变已运行二进制的更新源。
 
 若发现更高版本，会下载与当前平台匹配的资产，例如：
 

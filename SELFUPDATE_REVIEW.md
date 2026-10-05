@@ -8,6 +8,36 @@
 
 修复后，明确传入 `--disable-auto-update` 能禁止启动及定时的新更新，即使 env/JSON 设置 false；**它不是文件不可修改保证**：已经发生更新的安全回滚仍会执行，受信任服务端的通用远程 `exec`、terminal，以及人工更新脚本也不受此开关限制。
 
+## 本次修复：自动更新源切换到本仓库
+
+- 原默认仓库为 `src/version.zig` 中硬编码的 `luodaoyi/komari-zig-agent`；`src/update.zig` 的 `repo = version.repo` 用它构造 latest Release API。现改为本仓库 `Moyucharm/komari-zig-agent`，默认端点为 `https://api.github.com/repos/Moyucharm/komari-zig-agent/releases/latest`。
+- 目的：防止上游 Zig 仓库发布更高版本后，将我们编译部署的定制二进制覆盖为上游原版。没有关闭或删除自动更新；启动检查、6 小时定时检查、版本比较、校验及回滚逻辑不变。
+- 本仓库当前没有 Release，所以暂时不会自动更新二进制；检查仍执行，无 Release 时可能记录检查失败。代理回退只代理同一个本仓库 URL，不会切换回上游仓库。
+- 将来本仓库发布更高版本、具备当前平台匹配资产及有效 SHA256 校验信息的 Release 后，后续检查就能正常更新到本仓库改版，无需再次改代码。
+- `KOMARI_RELEASE_API_URL` 非空时仍可覆盖端点；缺失或空值使用本仓库。默认不查询上游的保证不涵盖人为指向上游的覆盖配置；部署时应清理这种旧配置，并重新编译、部署本次修复后的二进制。
+- `test/update_test.zig` 的永久回归直接调用生产 URL 解析函数，断言完整端点等于本仓库 URL 且不含上游 owner。改常量前真实失败（实际为上游 URL），改常量后 `All 1 tests passed.`；原来只复制覆盖字符串的辅助函数及对应测试已替换，bootstrap 中只固定旧仓库字符串的断言已移除。
+- 独立临时可执行程序通过 `runtime.init` 捕获真实进程环境，调用同一个生产 URL 解析函数并断言结果；按“变量缺失、空值、非空覆盖”顺序得到以下真实输出。没有下载 Release 或覆盖部署中的二进制，也未等待 6 小时。
+
+```text
+PASS release URL: https://api.github.com/repos/Moyucharm/komari-zig-agent/releases/latest
+PASS release URL: https://api.github.com/repos/Moyucharm/komari-zig-agent/releases/latest
+PASS release URL: http://127.0.0.1/release/latest
+```
+
+本次全量测试使用指定 Zig 0.16.0 路径执行，真实结果如下；临时 URL 实测源码和可执行文件已清理。改动保留在工作区，未提交 commit。
+
+```sh
+export PATH=/tmp/zig-x86_64-linux-0.16.0:$PATH
+zig build test --summary all
+```
+
+```text
+Build Summary: 66/66 steps succeeded; 229/232 tests passed (3 skipped)
+test success
+```
+
+以下调查与多场景实测记录属于此前的更新安全修复，保留为背景；本次没有重跑这些历史场景。
+
 ## 调查范围和验证方法
 
 - 用户指定基线：`main` / `186327c`；调查针对任务开始时的实际工作区，保留已有修改，未 reset。
@@ -243,4 +273,4 @@ python3 scripts/mock_komari_v2_e2e.py post-recover /tmp/komari-review-new/bin/ko
 zig build test --summary all
 ```
 
-**保留本地定制版本的操作建议：** 把 `--disable-auto-update` 固定写进实际服务的启动参数，不用废弃的 `--autoUpdate false`；另外自行保留定制二进制备份。若存在历史 pending marker，先检查备份和目标版本，不要以为加开关就会取消已开始的回滚。需要防止服务端通用命令改文件时，应另行限制远程管理权限和操作系统写权限，而不是依赖自更新开关。
+**保留本地定制版本的操作建议：** 重新编译并部署本次修复后，保持默认本仓库更新源即可避免上游 Release 覆盖，无需关闭自动更新；检查并移除指向上游的 `KOMARI_RELEASE_API_URL`。如果还需要禁止本仓库的新更新，可将 `--disable-auto-update` 固定写进实际服务的启动参数，不用废弃的 `--autoUpdate false`；另外自行保留定制二进制备份。若存在历史 pending marker，先检查备份和目标版本，不要以为改更新源或加开关就会取消已开始的回滚。需要防止服务端通用命令改文件时，应另行限制远程管理权限和操作系统写权限，而不是依赖更新源或自更新开关。

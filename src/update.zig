@@ -227,12 +227,8 @@ fn releaseApiUrl(allocator: std.mem.Allocator) ![]const u8 {
     return allocator.dupe(u8, "https://api.github.com/repos/" ++ repo ++ "/releases/latest");
 }
 
-fn releaseApiUrlFromEnvValue(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    return allocator.dupe(u8, value);
-}
-
-pub fn releaseApiUrlFromEnvValueForTest(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
-    return releaseApiUrlFromEnvValue(allocator, value);
+pub fn releaseApiUrlForTest(allocator: std.mem.Allocator) ![]const u8 {
+    return releaseApiUrl(allocator);
 }
 
 pub fn startBackground(allocator: std.mem.Allocator, cfg: config.Config) void {
