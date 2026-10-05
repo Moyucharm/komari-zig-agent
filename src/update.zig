@@ -128,7 +128,7 @@ pub fn recoverPendingUpdate(allocator: std.mem.Allocator) !void {
     };
     defer state.deinit(allocator);
 
-    if (!std.mem.eql(u8, state.target_version, version.current)) {
+    if (!std.mem.eql(u8, parseVersionPrefixless(state.target_version), parseVersionPrefixless(version.current))) {
         deleteFileIgnoreMissing(state_path);
         return;
     }
@@ -136,7 +136,7 @@ pub fn recoverPendingUpdate(allocator: std.mem.Allocator) !void {
     switch (pendingAction(state)) {
         .allow_start => {
             state.attempts += 1;
-            try writePendingStateFile(allocator, state_path, state);
+            try writePendingStateFile(allocator, state_path, state, false);
         },
         .rollback => {
             compat.renameAbsolute(state.backup_path, exe) catch |err| switch (err) {
@@ -192,7 +192,7 @@ pub fn confirmPendingUpdate(allocator: std.mem.Allocator) !bool {
         return true;
     };
     defer state.deinit(allocator);
-    if (!std.mem.eql(u8, state.target_version, version.current)) return false;
+    if (!std.mem.eql(u8, parseVersionPrefixless(state.target_version), parseVersionPrefixless(version.current))) return false;
     deleteFileIgnoreMissing(state.backup_path);
     deleteFileIgnoreMissing(state_path);
     return true;
@@ -282,13 +282,13 @@ fn downloadAndReplace(
     defer allocator.free(exe);
     const tmp = try std.fmt.allocPrint(allocator, "{s}.update", .{exe});
     defer allocator.free(tmp);
-    errdefer deleteFileIgnoreMissing(tmp);
     const backup = try backupPath(allocator, exe);
     defer allocator.free(backup);
     const state_path = try pendingStatePath(allocator, exe);
     defer allocator.free(state_path);
+    var file = try compat.createFileAbsolute(tmp, .{ .exclusive = true, .permissions = compat.executable_file_permissions });
+    errdefer deleteFileIgnoreMissing(tmp);
     {
-        var file = try compat.createFileAbsolute(tmp, .{ .truncate = true, .permissions = compat.executable_file_permissions });
         defer file.close(std.Options.debug_io);
         downloadReleaseAssetToFile(allocator, url, cfg, expected, file) catch |err| {
             logUpdateStageError("asset download", err);
@@ -306,7 +306,7 @@ fn downloadAndReplace(
         .target_version = target_version,
         .backup_path = backup,
         .attempts = 0,
-    });
+    }, true);
     errdefer deleteFileIgnoreMissing(state_path);
     try compat.renameAbsolute(tmp, exe);
     std.process.exit(42);
@@ -610,10 +610,11 @@ fn backupPath(allocator: std.mem.Allocator, exe: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.bak", .{exe});
 }
 
-fn writePendingStateFile(allocator: std.mem.Allocator, path: []const u8, state: PendingUpdateState) !void {
+fn writePendingStateFile(allocator: std.mem.Allocator, path: []const u8, state: PendingUpdateState, exclusive: bool) !void {
     const body = try allocPendingStateJson(allocator, state);
     defer allocator.free(body);
-    var file = try compat.createFileAbsolute(path, .{ .truncate = true, .permissions = compat.private_file_permissions });
+    var file = try compat.createFileAbsolute(path, .{ .truncate = true, .exclusive = exclusive, .permissions = compat.private_file_permissions });
+    errdefer if (exclusive) deleteFileIgnoreMissing(path);
     defer file.close(std.Options.debug_io);
     try file.writeStreamingAll(std.Options.debug_io, body);
 }
@@ -623,7 +624,10 @@ fn readSmallFile(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
 }
 
 fn copyFileAbsolute(src: []const u8, dst: []const u8) !void {
-    try compat.copyFileAbsolute(src, dst, compat.executable_file_permissions);
+    try std.Io.Dir.copyFileAbsolute(src, dst, std.Options.debug_io, .{
+        .permissions = compat.executable_file_permissions,
+        .replace = false,
+    });
 }
 
 fn runBinaryPreflight(allocator: std.mem.Allocator, path: []const u8) !void {

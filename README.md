@@ -98,7 +98,7 @@ curl -fsSL https://cdn.jsdelivr.net/gh/luodaoyi/komari-zig-agent@bd2e0b8de76a116
 
 ## 自更新
 
-Agent 启动后会检查：
+自更新默认开启；配置了 endpoint 和 token 的正常启动会立即检查，此后每 6 小时检查一次。未确认的新版本会跳过启动检查，并暂缓定时检查。检查地址：
 
 ```text
 https://api.github.com/repos/luodaoyi/komari-zig-agent/releases/latest
@@ -129,19 +129,29 @@ komari-agent-windows-arm64.exe
 komari-agent-windows-386.exe
 ```
 
-自更新同样优先直连 GitHub；Release API、二进制资产、`SHA256SUMS` 任一步直连失败，都会按内置代理池回退。可用 `KOMARI_GITHUB_PROXIES` 覆盖代理池，多个代理可用空格、逗号或分号分隔：
+Release API 默认直连，失败后回退到代理池；GitHub Release 二进制和 `SHA256SUMS` 资产优先尝试代理池，再尝试直连。可用 `KOMARI_GITHUB_PROXIES` 覆盖代理池，多个代理可用空格、逗号或分号分隔：
 
 ```sh
 KOMARI_GITHUB_PROXIES="https://gh.llkk.cc https://gh-proxy.com https://ghproxy.net"
 ```
 
-下载完成后会校验 GitHub Release API 的 `digest`；若 API 未返回 digest，则使用同 Release 的 `SHA256SUMS`。校验失败不会替换本机二进制。
+下载完成后会校验 GitHub Release API 的有效 SHA256 `digest`；若没有有效 digest，则使用同 Release 的 `SHA256SUMS`。缺少校验值、校验失败或新二进制 `--show-warning` 预检失败，均不会替换本机二进制。
 
-可用参数关闭自更新：
+**更新会替换当前运行的二进制，包括本地编译或手改的版本；不会合并本地修改，也不会更新源码目录、普通配置或数据文件。** 新版先写入同目录的 `<exe>.update`，旧版复制到 `<exe>.bak`，写入 `<exe>.update-state.json` 后通过 rename 替换，随后退出码为 `42`，需服务管理器或人工重新启动。
+
+已有同名 `.update` 或 `.bak` 文件（包括符号链接）会阻止本次更新，不会覆盖它们；需人工确认后再清理。这三个后缀是更新内部文件的保留名称，不要用来存放其他文件。
+
+新版第一次正常启动记录一次尝试；成功发送普通 WebSocket 报告或成功完成协议 v2 HTTP POST 报告后，删除备份和待确认状态。若确认前再次启动，则恢复 `.bak` 并以 `42` 退出。版本匹配忽略可选的 `v` / `V` 前缀。确认后的异常没有自动回滚备份；此机制也不是进程健康监控或无重启的故障恢复。
+
+可用参数关闭启动及定时自更新；明确的命令行禁用不会被环境变量或 JSON 配置中的 false 覆盖：
 
 ```sh
 --disable-auto-update
 ```
+
+也可设置 `AGENT_DISABLE_AUTO_UPDATE=true` 或 JSON 配置 `"disable_auto_update": true`。旧参数 `-autoUpdate` / `--autoUpdate` 已废弃，不能用于关闭更新。
+
+禁用新更新不取消已发生更新的安全回滚及健康确认，也不限制受信任服务端的远程 `exec` / terminal 权限或人工运行安装、替换脚本；它不是二进制不可修改的安全沙箱。
 
 ## 构建
 

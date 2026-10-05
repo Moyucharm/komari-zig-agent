@@ -553,6 +553,8 @@ class UpdateHandler(BaseHTTPRequestHandler):
     new_agent = b""
     sha = ""
     asset_name = "komari-agent-linux-amd64"
+    tag_name = "v9.9.9"
+    digest = None
 
     def log_message(self, fmt, *args):
         return
@@ -560,10 +562,15 @@ class UpdateHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         if parsed.path == "/release/latest":
+            with self.server.release_lock:
+                self.server.release_requests += 1
             asset = f"http://127.0.0.1:{self.server.server_address[1]}/download/{self.asset_name}"
             sums = f"http://127.0.0.1:{self.server.server_address[1]}/download/SHA256SUMS"
-            self.send_json({"tag_name": "v9.9.9", "assets": [
-                {"name": self.asset_name, "browser_download_url": asset},
+            binary_asset = {"name": self.asset_name, "browser_download_url": asset}
+            if self.digest is not None:
+                binary_asset["digest"] = self.digest
+            self.send_json({"tag_name": self.tag_name, "assets": [
+                binary_asset,
                 {"name": "SHA256SUMS", "browser_download_url": sums},
             ]})
         elif parsed.path.endswith(self.asset_name):
@@ -574,6 +581,14 @@ class UpdateHandler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.send_header("Content-Length", "0")
             self.end_headers()
+
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if urlparse(self.path).path == "/api/clients/uploadBasicInfo":
+            self.server.startup_seen.set()
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def send_json(self, payload):
         self.send_body(json.dumps(payload).encode())
@@ -587,75 +602,223 @@ class UpdateHandler(BaseHTTPRequestHandler):
 
 def run_self_update_e2e(args):
     with tempfile.TemporaryDirectory(prefix="komari-update-e2e-") as tmp:
-        old_path = os.path.join(tmp, "komari-agent")
-        shutil.copy2(args.old_agent, old_path)
-        os.chmod(old_path, 0o755)
+        with open(args.old_agent, "rb") as fh:
+            old_bytes = fh.read()
         with open(args.new_agent, "rb") as fh:
             new_bytes = fh.read()
+        old_sha = hashlib.sha256(old_bytes).hexdigest()
+        new_sha = hashlib.sha256(new_bytes).hexdigest()
         UpdateHandler.new_agent = new_bytes
-        UpdateHandler.sha = hashlib.sha256(new_bytes).hexdigest()
+        UpdateHandler.sha = new_sha
         server = ThreadingHTTPServer(("127.0.0.1", 0), UpdateHandler)
+        server.release_requests = 0
+        server.release_lock = threading.Lock()
+        server.startup_seen = threading.Event()
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        env = os.environ.copy()
-        env["KOMARI_RELEASE_API_URL"] = f"http://127.0.0.1:{server.server_address[1]}/release/latest"
-        try:
-            first = subprocess.run([
-                old_path, "--endpoint", f"http://127.0.0.1:{server.server_address[1]}",
-                "--token", TOKEN, "--protocol-version", str(args.protocol_version), "--show-warning=false",
-            ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=20)
-            if first.returncode != 42:
-                raise RuntimeError(f"update did not exit 42: {first.returncode}\n{first.stdout}")
-            second = subprocess.run([old_path, "--protocol-version", str(args.protocol_version), "--show-warning"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-            if second.returncode != 0:
-                raise RuntimeError(f"updated binary preflight failed: {second.returncode}\n{second.stdout}")
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_")}
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        env["KOMARI_RELEASE_API_URL"] = endpoint + "/release/latest"
+        common = [
+            "--protocol-version", str(args.protocol_version),
+            "--show-warning=false", "--max-retries", "0", "--reconnect-interval", "1",
+            "--info-report-interval", "60",
+            "--custom-ipv4", "203.0.113.10", "--custom-ipv6", "2001:db8::10",
+        ]
+        case = "input binaries"
+
+        def require(condition, message):
+            if not condition:
+                raise RuntimeError(message)
+
+        def check_bytes(path, expected, expected_sha):
+            require(not os.path.islink(path), f"unexpected symlink: {path}")
+            with open(path, "rb") as fh:
+                actual = fh.read()
+            require(actual == expected, f"contents changed unexpectedly: {path}")
+            require(hashlib.sha256(actual).hexdigest() == expected_sha, f"SHA256 mismatch: {path}")
+
+        def require_absent(path):
+            require(not os.path.lexists(path), f"unexpected leftover: {path}")
+
+        def make_old(name):
+            path = os.path.join(tmp, name)
+            shutil.copy2(args.old_agent, path)
+            os.chmod(path, 0o755)
+            check_bytes(path, old_bytes, old_sha)
+            return path
+
+        def release_requests():
+            with server.release_lock:
+                return server.release_requests
+
+        def configure_release(tag="v9.9.9", digest=None):
+            UpdateHandler.tag_name = tag
+            UpdateHandler.digest = digest
+            with server.release_lock:
+                server.release_requests = 0
+            server.startup_seen.clear()
+
+        def run_capture(path, cli):
+            return subprocess.run(
+                [path] + cli, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, timeout=20,
+            )
+
+        def check_pending(path, tag, attempts):
+            with open(path + ".update-state.json", "r", encoding="utf-8") as fh:
+                pending = json.load(fh)
+            require(pending.get("previous_version") == "v0.0.1", f"bad previous version: {pending}")
+            require(pending.get("target_version") == tag, f"bad target version: {pending}")
+            require(pending.get("backup_path") == path + ".bak", f"bad backup path: {pending}")
+            require(pending.get("attempts") == attempts, f"bad attempts marker: {pending}")
+            check_bytes(path, new_bytes, new_sha)
+            check_bytes(path + ".bak", old_bytes, old_sha)
+
+        def install_update(path, tag):
+            updated = run_capture(path, ["--endpoint", endpoint, "--token", TOKEN] + common)
+            require(updated.returncode == 42, f"update did not exit 42: {updated.returncode}\n{updated.stdout}")
+            require(release_requests() > 0, "update did not request release metadata")
+            check_pending(path, tag, 0)
+            require_absent(path + ".update")
+
+        def check_version(path, version):
+            result = run_capture(path, ["--disable-auto-update"])
+            require(result.returncode == 0 and f"Komari Agent {version}" in result.stdout,
+                    f"version check failed: {result.returncode}\n{result.stdout}")
+
+        def run_reporting(path, cli, process_env, confirm=False):
             tcp = TcpAcceptServer(("127.0.0.1", 0), TcpAcceptHandler)
             threading.Thread(target=tcp.serve_forever, daemon=True).start()
-            confirm_state = State(token=TOKEN, exec_enabled=False, ping_tasks=[{
-                "task_id": 77,
-                "ping_type": "tcp",
+            state = State(token=TOKEN, exec_enabled=False, ping_tasks=[{
+                "task_id": 77, "ping_type": "tcp",
                 "ping_target": f"127.0.0.1:{tcp.server_address[1]}",
             }])
-            panel = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(confirm_state))
+            panel = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
             threading.Thread(target=panel.serve_forever, daemon=True).start()
             output = []
-            confirm_proc, deadline = run_agent([
-                old_path,
-                "--endpoint", f"http://127.0.0.1:{panel.server_address[1]}",
-                "--token", TOKEN,
-                "--protocol-version", str(args.protocol_version),
-                "--disable-auto-update",
-                "--max-retries", "0",
-                "--reconnect-interval", "1",
-                "--info-report-interval", "60",
-                "--custom-ipv4", "203.0.113.10",
-                "--custom-ipv6", "2001:db8::10",
-            ], os.environ.copy(), 20, output)
+            proc = None
             try:
+                proc, deadline = run_agent([
+                    path, "--endpoint", f"http://127.0.0.1:{panel.server_address[1]}",
+                    "--token", TOKEN,
+                ] + common + cli, process_env, 20, output)
                 while time.monotonic() < deadline:
-                    if confirm_state.report_seen.is_set() and confirm_state.ping_seen.is_set():
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"agent exited before normal report: {proc.returncode}\n{''.join(output[-80:])}")
+                    if state.error:
+                        raise RuntimeError(state.error)
+                    cleaned = not confirm or not any(os.path.lexists(path + suffix) for suffix in (
+                        ".bak", ".update-state.json",
+                    ))
+                    if state.report_seen.is_set() and state.ping_seen.is_set() and cleaned:
                         break
-                    if confirm_proc.poll() is not None:
-                        raise RuntimeError(f"updated agent exited before confirm report: {confirm_proc.returncode}\n{''.join(output[-80:])}")
-                    if confirm_state.error:
-                        raise RuntimeError(confirm_state.error)
                     time.sleep(0.05)
                 else:
-                    raise RuntimeError(f"updated agent confirm timeout\n{''.join(output[-80:])}")
+                    raise RuntimeError(f"normal report/confirmation timeout\n{''.join(output[-80:])}")
             finally:
-                terminate(confirm_proc)
+                if proc is not None:
+                    terminate(proc)
                 panel.shutdown()
                 panel.server_close()
                 tcp.shutdown()
                 tcp.server_close()
-            if os.path.exists(old_path + ".bak") or os.path.exists(old_path + ".update-state.json"):
-                raise RuntimeError("pending update files were not confirmed and cleaned")
-            version = subprocess.run([
-                old_path,
-                "--disable-auto-update",
-            ], env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-            if version.returncode != 0 or "Komari Agent v9.9.9" not in version.stdout:
-                raise RuntimeError(f"updated binary version check failed: {version.returncode}\n{version.stdout}")
+            require(proc.returncode == 0, f"reporting agent did not exit normally: {proc.returncode}\n{''.join(output[-80:])}")
 
+        def run_unconfirmed_start(path):
+            server.startup_seen.clear()
+            output = []
+            proc, deadline = run_agent([
+                path, "--endpoint", endpoint, "--token", TOKEN,
+            ] + common, env, 20, output)
+            try:
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        raise RuntimeError(f"agent exited before failed business startup: {proc.returncode}\n{''.join(output[-80:])}")
+                    if server.startup_seen.is_set():
+                        break
+                    time.sleep(0.05)
+                else:
+                    raise RuntimeError(f"agent did not reach failed business startup\n{''.join(output[-80:])}")
+            finally:
+                terminate(proc)
+            require(proc.returncode == 0, f"unconfirmed agent did not exit normally: {proc.returncode}\n{''.join(output[-80:])}")
+
+        try:
+            require(old_sha != new_sha, "old and new agent binaries must differ")
+            for tag in ("v9.9.9", "V9.9.9"):
+                case = f"successful update and normal-report confirmation tag={tag}"
+                configure_release(tag, "sha256:" + new_sha if tag.startswith("V") else None)
+                path = make_old("success-" + tag)
+                install_update(path, tag)
+                preflight = run_capture(path, ["--protocol-version", str(args.protocol_version), "--show-warning"])
+                require(preflight.returncode == 0, f"updated binary preflight failed: {preflight.returncode}\n{preflight.stdout}")
+                check_pending(path, tag, 0)
+                run_reporting(path, ["--disable-auto-update"], env, confirm=True)
+                check_bytes(path, new_bytes, new_sha)
+                for suffix in (".bak", ".update-state.json", ".update"):
+                    require_absent(path + suffix)
+                check_version(path, "v9.9.9")
+
+            for suffix in (".update", ".bak"):
+                for symlink in (False, True):
+                    case = f"{suffix} {'symlink' if symlink else 'regular-file'} conflict"
+                    configure_release()
+                    path = make_old("conflict-" + suffix[1:] + ("-symlink" if symlink else "-regular"))
+                    conflict = path + suffix
+                    target = conflict + ".target" if symlink else conflict
+                    sentinel = (case + " must remain intact\n").encode()
+                    sentinel_sha = hashlib.sha256(sentinel).hexdigest()
+                    with open(target, "wb") as fh:
+                        fh.write(sentinel)
+                    if symlink:
+                        os.symlink(target, conflict)
+                    run_unconfirmed_start(path)
+                    require(release_requests() > 0, "conflict did not exercise a real update check")
+                    check_bytes(path, old_bytes, old_sha)
+                    check_bytes(target, sentinel, sentinel_sha)
+                    if symlink:
+                        require(os.path.islink(conflict), "conflicting symlink was removed or replaced")
+                        require(os.readlink(conflict) == target, "conflicting symlink target changed")
+                        with open(conflict, "rb") as fh:
+                            require(fh.read() == sentinel, "symlink no longer resolves to original contents")
+                    require_absent(path + ".update-state.json")
+                    require_absent(path + (".bak" if suffix == ".update" else ".update"))
+
+            for source in ("environment", "JSON"):
+                case = f"explicit --disable-auto-update overrides {source} false"
+                configure_release()
+                path = make_old("disabled-" + source.lower())
+                process_env = env.copy()
+                cli = ["--disable-auto-update"]
+                if source == "environment":
+                    process_env["AGENT_DISABLE_AUTO_UPDATE"] = "false"
+                else:
+                    config_path = path + ".json"
+                    with open(config_path, "w", encoding="utf-8") as fh:
+                        json.dump({"disable_auto_update": False}, fh)
+                    cli += ["--config", config_path]
+                run_reporting(path, cli, process_env)
+                require(release_requests() == 0, "disabled agent requested release metadata")
+                check_bytes(path, old_bytes, old_sha)
+                for suffix in (".update", ".bak", ".update-state.json"):
+                    require_absent(path + suffix)
+
+            case = "prefixless release tag=9.9.9 two unconfirmed starts restore old bytes"
+            configure_release("9.9.9")
+            path = make_old("unconfirmed-prefixless")
+            install_update(path, "9.9.9")
+            run_unconfirmed_start(path)
+            check_pending(path, "9.9.9", 1)
+            second_start = run_capture(path, [
+                "--endpoint", endpoint, "--token", TOKEN, "--disable-auto-update",
+            ] + common)
+            require(second_start.returncode == 42, f"second unconfirmed start did not roll back: {second_start.returncode}\n{second_start.stdout}")
+            check_bytes(path, old_bytes, old_sha)
+            for suffix in (".bak", ".update-state.json", ".update"):
+                require_absent(path + suffix)
+            check_version(path, "v0.0.1")
+
+            case = "normal pending-update rollback"
             rollback_path = os.path.join(tmp, "komari-agent-rollback")
             shutil.copy2(args.new_agent, rollback_path)
             os.chmod(rollback_path, 0o755)
@@ -663,20 +826,19 @@ def run_self_update_e2e(args):
             os.chmod(rollback_path + ".bak", 0o755)
             with open(rollback_path + ".update-state.json", "w", encoding="utf-8") as fh:
                 json.dump({"previous_version": "v0.0.1", "target_version": "v9.9.9", "backup_path": rollback_path + ".bak", "attempts": 1}, fh)
-            rollback = subprocess.run([
-                rollback_path,
-                "--endpoint", f"http://127.0.0.1:{server.server_address[1]}",
-                "--token", TOKEN,
-                "--protocol-version", str(args.protocol_version),
-                "--disable-auto-update",
-                "--max-retries", "0",
-            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10)
-            if rollback.returncode != 42:
-                raise RuntimeError(f"rollback did not exit 42: {rollback.returncode}\n{rollback.stdout}")
+            check_pending(rollback_path, "v9.9.9", 1)
+            rollback = run_capture(rollback_path, [
+                "--endpoint", endpoint, "--token", TOKEN, "--disable-auto-update",
+            ] + common)
+            require(rollback.returncode == 42, f"rollback did not exit 42: {rollback.returncode}\n{rollback.stdout}")
+            check_bytes(rollback_path, old_bytes, old_sha)
+            for suffix in (".bak", ".update-state.json", ".update"):
+                require_absent(rollback_path + suffix)
+            check_version(rollback_path, "v0.0.1")
             print("mock komari self-update e2e ok")
             return 0
         except Exception as exc:
-            print(f"self-update e2e failed: {exc}", file=sys.stderr)
+            print(f"self-update e2e failed [{case}]: {exc}", file=sys.stderr)
             return 1
         finally:
             server.shutdown()

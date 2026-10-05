@@ -260,17 +260,22 @@ fn runPostFallback(allocator: std.mem.Allocator, cfg: config.Config, stop_reques
     var last_report_ms = compat.milliTimestamp();
     var last_pull_ms = compat.milliTimestamp() - @as(i64, @intCast(pull_interval_ms));
     var last_reconnect_ms = compat.milliTimestamp() - @as(i64, @intCast(reconnect_interval_ms));
+    var update_confirmed = false;
 
     while (!isStopRequested(stop_requested)) {
         const now_ms = compat.milliTimestamp();
         if (@as(u64, @intCast(@max(now_ms - last_report_ms, 0))) >= report_interval_ms) {
             last_report_ms = now_ms;
-            postV2ReportOnce(allocator, cfg) catch |err| {
+            if (postV2ReportOnce(allocator, cfg)) |_| {
+                if (!update_confirmed) {
+                    update_confirmed = update.confirmPendingUpdate(allocator) catch false;
+                }
+            } else |err| {
                 if (v2_state.noteV2AttemptResult(2, err).fallback) {
                     v2_state.setConnectionProtocolVersion(1);
                     return err;
                 }
-            };
+            }
         }
         if (@as(u64, @intCast(@max(now_ms - last_pull_ms, 0))) >= pull_interval_ms) {
             last_pull_ms = now_ms;

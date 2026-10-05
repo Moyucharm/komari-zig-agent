@@ -45,8 +45,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     if (try runPingDiagnostic(allocator, args)) return;
 
     var cfg = try config.parseArgs(config_allocator, args);
+    const cli_disable_auto_update = cfg.disable_auto_update;
     try cfg.loadEnv(config_allocator);
     if (cfg.config_file.len != 0) try cfg.loadJsonFile(config_allocator, cfg.config_file);
+    cfg.disable_auto_update = cli_disable_auto_update or cfg.disable_auto_update;
     try cfg.normalize();
     v2_state.initRequestedProtocolVersion(cfg.protocol_version);
     v2_state.resetConnectionProtocolVersion();

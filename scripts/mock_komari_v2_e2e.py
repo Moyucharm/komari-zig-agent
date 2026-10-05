@@ -4,10 +4,12 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -852,22 +854,47 @@ def run_post_fallback(args):
     state = State(token, exec_enabled, exec_task_id, exec_command(), ping_task_id, ping_target)
     server = QuietThreadingHTTPServer(("127.0.0.1", 0), make_post_fallback_handler(state))
     threading.Thread(target=server.serve_forever, daemon=True).start()
-
-    endpoint = f"http://127.0.0.1:{server.server_address[1]}"
-    proc, output_lines, deadline = run_agent(args.agent, endpoint, token, args.timeout, 2, args.no_exec)
+    tmp = tempfile.TemporaryDirectory(prefix="komari-post-update-e2e-")
+    proc = None
     try:
+        agent = os.path.join(tmp.name, "komari-agent")
+        shutil.copy2(args.agent, agent)
+        env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_")}
+        version = subprocess.run([agent, "--disable-auto-update"], env=env, capture_output=True, text=True, timeout=10)
+        version_line = next((line for line in version.stdout.splitlines() if line.startswith("Komari Agent ")), None)
+        if version.returncode != 0 or version_line is None:
+            raise RuntimeError(f"cannot read agent version: {version.returncode}\n{version.stdout}\n{version.stderr}")
+        backup = agent + ".bak"
+        marker = agent + ".update-state.json"
+        shutil.copy2(agent, backup)
+        with open(marker, "w", encoding="utf-8") as fh:
+            json.dump({"previous_version": "previous", "target_version": version_line.removeprefix("Komari Agent "), "backup_path": backup, "attempts": 0}, fh)
+        endpoint = f"http://127.0.0.1:{server.server_address[1]}"
+        proc, output_lines, deadline = run_agent(agent, endpoint, token, args.timeout, 2, args.no_exec)
         wait_for_post_fallback(state, proc, output_lines, deadline)
+        while os.path.exists(marker) or os.path.exists(backup):
+            if time.monotonic() >= deadline or proc.poll() is not None:
+                raise RuntimeError("healthy POST reports did not confirm the pending update")
+            time.sleep(0.05)
+        terminate(proc)
+        proc = None
+        restart = subprocess.run([agent, "--disable-auto-update"], env=env, capture_output=True, text=True, timeout=10)
+        if restart.returncode != 0:
+            raise RuntimeError(f"healthy POST agent rolled back on restart: {restart.returncode}\n{restart.stdout}\n{restart.stderr}")
+        print("post fallback pending update confirmed; restart rc=0")
         print("mock komari v2 post fallback e2e ok")
         return 0
     except Exception as exc:
         print(f"v2 post fallback e2e failed: {exc}", file=sys.stderr)
         return 1
     finally:
-        terminate(proc)
+        if proc is not None:
+            terminate(proc)
         server.shutdown()
         server.server_close()
         tcp.shutdown()
         tcp.server_close()
+        tmp.cleanup()
 
 
 def run_post_recover(args):
