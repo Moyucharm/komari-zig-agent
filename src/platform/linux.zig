@@ -7,6 +7,8 @@ const debug = @import("debug");
 
 /// Container-aware cgroup resource collector (same-directory module).
 pub const cgroup = @import("linux_cgroup.zig");
+/// Plausibility guard for `/proc/stat` CPU counters (same-directory module).
+pub const cpu_guard = @import("linux_cpu_guard.zig");
 
 const safe_command_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/rocm/bin";
 
@@ -35,6 +37,7 @@ var resource_mutex: compat.Mutex = .{};
 var resource_collector: cgroup.Collector = cgroup.Collector.init(.{});
 var previous_network: ?NetworkSample = null;
 var previous_cpu: ?CpuSample = null;
+var cpu_monitor: cpu_guard.Monitor = .{};
 var cached_disk: ?CachedDiskSample = null;
 var cached_connections: ?CachedConnectionsSample = null;
 var cached_process: ?CachedProcessSample = null;
@@ -64,11 +67,16 @@ const NetworkSample = struct {
 pub const CpuStat = struct {
     idle: u64,
     total: u64,
+    /// user..steal ticks, excluding guest time already counted in user.
+    accounted: u64 = 0,
+    /// Number of per-CPU `cpuN` lines; 0 when unknown.
+    cpu_lines: u32 = 0,
 };
 
 const CpuSample = struct {
     stat: CpuStat,
     host_proc: []const u8,
+    monotonic_ns: i128,
 };
 
 const CachedDiskSample = struct {
@@ -1467,27 +1475,45 @@ fn sampleNetworkCounters(options: common.SnapshotOptions) !common.NetworkInfo {
 
 fn cpuUsage(host_proc: []const u8) !f64 {
     const current = try readCpuStat(host_proc) orelse return 0.001;
+    const now_ns = monotonicNs();
 
     sample_mutex.lock();
     defer sample_mutex.unlock();
 
-    const usage = if (previous_cpu) |previous|
-        if (std.mem.eql(u8, previous.host_proc, host_proc)) cpuUsagePercent(previous.stat, current) else 0.001
-    else
-        0.001;
-    previous_cpu = .{ .stat = current, .host_proc = host_proc };
+    var usage: f64 = 0.001;
+    if (previous_cpu) |previous| {
+        if (std.mem.eql(u8, previous.host_proc, host_proc)) {
+            const was_processes = cpu_monitor.use_processes;
+            usage = cpu_monitor.resolve(cpuUsagePercent(previous.stat, current), .{
+                .accounted_delta = current.accounted -| previous.stat.accounted,
+                .cpu_lines = @max(previous.stat.cpu_lines, current.cpu_lines),
+                .elapsed_ns = now_ns - previous.monotonic_ns,
+            }, if (host_proc.len == 0) "/proc" else host_proc, now_ns, try cpuCoreCount());
+            if (was_processes != cpu_monitor.use_processes) {
+                debug.log("linux cpu usage source: {s}", .{if (cpu_monitor.use_processes) "per-process (/proc/stat counters implausible)" else "/proc/stat"});
+            }
+        } else cpu_monitor.reset();
+    }
+    previous_cpu = .{ .stat = current, .host_proc = host_proc, .monotonic_ns = now_ns };
     return if (usage <= 0.001) 0.001 else usage;
 }
 
 fn readCpuStat(host_proc: []const u8) !?CpuStat {
-    var buf: [8192]u8 = undefined;
+    var buf: [32 * 1024]u8 = undefined;
     const bytes = readSmallProcFile(host_proc, "stat", &buf) orelse return null;
-    return parseCpuStat(bytes);
+    var stat = parseCpuStat(bytes) orelse return null;
+    // A truncated read may have cut the per-CPU lines short.
+    if (bytes.len == buf.len) stat.cpu_lines = 0;
+    return stat;
 }
 
 pub fn parseCpuStat(bytes: []const u8) ?CpuStat {
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     const line = lines.next() orelse return null;
+    var cpu_lines: u32 = 0;
+    while (lines.next()) |rest| {
+        if (rest.len > 3 and std.mem.startsWith(u8, rest, "cpu") and std.ascii.isDigit(rest[3])) cpu_lines += 1;
+    }
     var fields = std.mem.tokenizeAny(u8, line, " \t");
     const label = fields.next() orelse return null;
     if (!std.mem.eql(u8, label, "cpu")) return null;
@@ -1502,7 +1528,9 @@ pub fn parseCpuStat(bytes: []const u8) ?CpuStat {
     if (count < 4) return null;
     var total: u64 = 0;
     for (values[0..count]) |value| total += value;
-    return .{ .idle = values[3] + if (count > 4) values[4] else 0, .total = total };
+    var accounted: u64 = 0;
+    for (values[0..@min(count, 8)]) |value| accounted += value;
+    return .{ .idle = values[3] + if (count > 4) values[4] else 0, .total = total, .accounted = accounted, .cpu_lines = cpu_lines };
 }
 
 pub fn cpuUsagePercent(previous: CpuStat, current: CpuStat) f64 {
