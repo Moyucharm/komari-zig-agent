@@ -92,7 +92,54 @@ test "utc timestamp formats as unsigned rfc3339" {
     try std.testing.expectEqualStrings("1970-01-01T00:00:00Z", text);
 }
 
-test "uploadExecResult keeps v1 task result upload for v2 sessions" {
+test "uploadExecResult posts agent.taskResult over v2 rpc for v2 sessions" {
+    const response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 47\r\nConnection: close\r\n\r\n{\"jsonrpc\":\"2.0\",\"result\":{\"status\":\"success\"}}";
+    const responses = [_][]const u8{response};
+    var server = try local_http.Server.start(std.testing.allocator, &responses);
+    errdefer server.join() catch unreachable;
+
+    const endpoint = try server.url(std.testing.allocator, "");
+    defer std.testing.allocator.free(endpoint);
+    try task.uploadExecResult(std.testing.allocator, uploadTestConfig(endpoint), 2, "task-1", "ignored");
+
+    var completed = try server.finish();
+    defer completed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), completed.requests.len);
+    const request = completed.requests[0];
+    try std.testing.expectEqualStrings("POST /api/clients/v2/rpc?token=tok HTTP/1.1", request.requestLine());
+    try std.testing.expectEqualStrings("application/json", request.header("Content-Type").?);
+    try std.testing.expect(request.header("Content-Encoding") == null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.body, .{});
+    defer parsed.deinit();
+    const root = try expectObject(parsed.value);
+    try expectStringField(root, "jsonrpc", "2.0");
+    try expectStringField(root, "method", "agent.taskResult");
+    try std.testing.expect(root.get("id") == null);
+    try expectTaskResultFields(try expectObjectValue(root, "params"));
+}
+
+test "uploadExecResult falls back to legacy endpoint when v2 rpc rejects agent.taskResult" {
+    const rejected = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const ok = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    const responses = [_][]const u8{ rejected, ok };
+    var server = try local_http.Server.start(std.testing.allocator, &responses);
+    errdefer server.join() catch unreachable;
+
+    const endpoint = try server.url(std.testing.allocator, "");
+    defer std.testing.allocator.free(endpoint);
+    try task.uploadExecResult(std.testing.allocator, uploadTestConfig(endpoint), 2, "task-1", "ignored");
+
+    var completed = try server.finish();
+    defer completed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), completed.requests.len);
+    try std.testing.expectEqualStrings("POST /api/clients/v2/rpc?token=tok HTTP/1.1", completed.requests[0].requestLine());
+    try expectLegacyTaskResultRequest(completed.requests[1]);
+}
+
+test "uploadExecResult keeps legacy task result upload for v1 sessions" {
     const response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
     const responses = [_][]const u8{response};
     var server = try local_http.Server.start(std.testing.allocator, &responses);
@@ -100,20 +147,26 @@ test "uploadExecResult keeps v1 task result upload for v2 sessions" {
 
     const endpoint = try server.url(std.testing.allocator, "");
     defer std.testing.allocator.free(endpoint);
-    const cfg = config.Config{
+    try task.uploadExecResult(std.testing.allocator, uploadTestConfig(endpoint), 1, "task-1", "ignored");
+
+    var completed = try server.finish();
+    defer completed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), completed.requests.len);
+    try expectLegacyTaskResultRequest(completed.requests[0]);
+}
+
+fn uploadTestConfig(endpoint: []const u8) config.Config {
+    return .{
         .endpoint = endpoint,
         .token = "tok",
         .disable_compression = true,
         .disable_web_ssh = true,
         .max_retries = 0,
     };
-    try task.uploadExecResult(std.testing.allocator, cfg, 2, "task-1", "ignored");
+}
 
-    var completed = try server.finish();
-    defer completed.deinit();
-
-    try std.testing.expectEqual(@as(usize, 1), completed.requests.len);
-    const request = completed.requests[0];
+fn expectLegacyTaskResultRequest(request: local_http.RecordedRequest) !void {
     try std.testing.expectEqualStrings("POST /api/clients/task/result?token=tok HTTP/1.1", request.requestLine());
     try std.testing.expectEqualStrings("komari-zig-agent", request.header("User-Agent").?);
     try std.testing.expectEqualStrings("application/json", request.header("Content-Type").?);
@@ -121,11 +174,14 @@ test "uploadExecResult keeps v1 task result upload for v2 sessions" {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, request.body, .{});
     defer parsed.deinit();
-    const root = try expectObject(parsed.value);
-    try expectStringField(root, "task_id", "task-1");
-    try expectStringField(root, "result", "Remote control is disabled.");
-    try expectIntField(root, "exit_code", -1);
-    const finished_at = root.get("finished_at") orelse return error.TestUnexpectedResult;
+    try expectTaskResultFields(try expectObject(parsed.value));
+}
+
+fn expectTaskResultFields(object: std.json.ObjectMap) !void {
+    try expectStringField(object, "task_id", "task-1");
+    try expectStringField(object, "result", "Remote control is disabled.");
+    try expectIntField(object, "exit_code", -1);
+    const finished_at = object.get("finished_at") orelse return error.TestUnexpectedResult;
     if (finished_at != .string) return error.TestUnexpectedResult;
     try std.testing.expect(std.mem.endsWith(u8, finished_at.string, "Z"));
 }

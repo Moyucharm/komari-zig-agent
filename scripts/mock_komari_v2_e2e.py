@@ -229,6 +229,17 @@ def validate_task_result(body, task_id, expected_output):
         raise ValueError("taskResult: missing finished_at")
 
 
+def validate_task_result_rpc(body, task_id, expected_output):
+    if body.get("jsonrpc") != "2.0":
+        raise ValueError("taskResult: bad jsonrpc")
+    if body.get("method") != "agent.taskResult":
+        raise ValueError(f"taskResult: bad method {body.get('method')!r}")
+    params = body.get("params")
+    if not isinstance(params, dict):
+        raise ValueError("taskResult: missing params")
+    validate_task_result(params, task_id, expected_output)
+
+
 def jsonrpc_success(id_value=None, result=None):
     payload = {"jsonrpc": "2.0", "result": result if result is not None else {"status": "ok"}}
     if id_value is not None:
@@ -264,8 +275,6 @@ def make_ws_handler(state):
             parsed = urlparse(self.path)
             if parsed.path == "/api/clients/v2/rpc":
                 self.handle_rpc_post(parsed)
-            elif parsed.path == "/api/clients/task/result":
-                self.handle_task_result(parsed)
             else:
                 send_plain(self, 404, b"not found")
 
@@ -293,29 +302,18 @@ def make_ws_handler(state):
             body = self.read_body()
             try:
                 payload = json.loads(maybe_decode_gzip(self, body).decode("utf-8"))
+                if payload.get("method") == "agent.taskResult":
+                    validate_task_result_rpc(payload, state.exec_task_id, "v2-exec-ok")
+                    state.task_result_seen.set()
+                    send_json(self, jsonrpc_success(result={"status": "success"}))
+                    return
                 validate_basic_info_rpc(payload)
             except Exception as exc:
-                state.set_error(f"bad v2 basic info payload: {exc}; body={body!r}")
+                state.set_error(f"bad v2 rpc payload: {exc}; body={body!r}")
                 send_plain(self, 400, b"bad payload")
                 return
             state.upload_seen.set()
             send_json(self, jsonrpc_success(result={"status": "ok"}))
-
-        def handle_task_result(self, parsed):
-            if not self.token_ok(parsed):
-                send_plain(self, 403, b"bad token")
-                state.set_error("bad task result token")
-                return
-            body = self.read_body()
-            try:
-                payload = json.loads(body.decode("utf-8"))
-                validate_task_result(payload, state.exec_task_id, "v2-exec-ok")
-            except Exception as exc:
-                state.set_error(f"bad task result payload: {exc}; body={body!r}")
-                send_plain(self, 400, b"bad payload")
-                return
-            state.task_result_seen.set()
-            send_plain(self, 200, b"ok")
 
         def handle_ws(self, parsed):
             if not self.token_ok(parsed):
@@ -493,8 +491,6 @@ def make_post_fallback_handler(state, recover_ws=False):
             parsed = urlparse(self.path)
             if parsed.path == "/api/clients/v2/rpc":
                 self.handle_rpc(parsed)
-            elif parsed.path == "/api/clients/task/result":
-                self.handle_task_result(parsed)
             else:
                 send_plain(self, 404, b"not found")
 
@@ -616,24 +612,19 @@ def make_post_fallback_handler(state, recover_ws=False):
                 send_json(self, jsonrpc_success(result={"status": "ok"}))
                 return
 
+            if method == "agent.taskResult":
+                try:
+                    validate_task_result_rpc(payload, state.exec_task_id, "v2-exec-ok")
+                except Exception as exc:
+                    state.set_error(str(exc))
+                    send_plain(self, 400, b"bad payload")
+                    return
+                state.task_result_seen.set()
+                send_json(self, jsonrpc_success(result={"status": "success"}))
+                return
+
             state.set_error(f"unexpected v2 rpc method: {method!r}")
             send_plain(self, 400, b"bad payload")
-
-        def handle_task_result(self, parsed):
-            if not self.token_ok(parsed):
-                send_plain(self, 403, b"bad token")
-                state.set_error("bad task result token")
-                return
-            body = self.read_body()
-            try:
-                payload = json.loads(body.decode("utf-8"))
-                validate_task_result(payload, state.exec_task_id, "v2-exec-ok")
-            except Exception as exc:
-                state.set_error(f"bad task result payload: {exc}; body={body!r}")
-                send_plain(self, 400, b"bad payload")
-                return
-            state.task_result_seen.set()
-            send_plain(self, 200, b"ok")
 
         def handle_recovery_ws(self):
             key = self.headers.get("Sec-WebSocket-Key")

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const http = @import("http.zig");
+const v2 = @import("v2.zig");
 const compat = @import("compat");
 
 pub const max_command_output_bytes: usize = 4 * 1024 * 1024;
@@ -171,7 +172,6 @@ pub fn runCommandDetailedWithRunner(allocator: std.mem.Allocator, command: []con
 }
 
 pub fn uploadExecResult(allocator: std.mem.Allocator, cfg: anytype, protocol_version: i32, task_id: []const u8, command: []const u8) !void {
-    _ = protocol_version;
     if (task_id.len == 0) return;
     const result = if (cfg.disable_web_ssh)
         try disabledRemoteControlResult(allocator)
@@ -181,11 +181,34 @@ pub fn uploadExecResult(allocator: std.mem.Allocator, cfg: anytype, protocol_ver
 
     const finished = try utcNow(allocator);
     defer allocator.free(finished);
+    if (protocol_version >= 2) {
+        // Go agent 1.5+ / Komari 1.5+: agent.taskResult over POST /api/clients/v2/rpc.
+        const rpc = try v2.allocTaskResultNotification(allocator, task_id, result.output, result.exit_code, finished);
+        defer allocator.free(rpc);
+        if (postV2Rpc(allocator, cfg, rpc)) |_| {
+            return;
+        } else |err| switch (err) {
+            // Komari 1.2-1.4 speak v2 but reject agent.taskResult; they still serve the legacy endpoint.
+            error.HttpStatusNotOk => {},
+            else => return err,
+        }
+    }
     const payload = try allocTaskResultJson(allocator, task_id, result.output, result.exit_code, finished);
     defer allocator.free(payload);
     const url = try http.taskResultUrl(allocator, cfg.endpoint, cfg.token);
     defer allocator.free(url);
     try http.postJson(allocator, url, payload, cfg);
+}
+
+fn postV2Rpc(allocator: std.mem.Allocator, cfg: anytype, payload: []const u8) !void {
+    const body = try http.maybeGzip(allocator, payload, !cfg.disable_compression);
+    defer allocator.free(body.body);
+    var headers = http.Headers{};
+    if (body.compressed) headers.content_encoding = "gzip";
+    const url = try http.v2RpcUrl(allocator, cfg.endpoint, cfg.token);
+    defer allocator.free(url);
+    const response = try http.postJsonReadAuthHeaders(allocator, url, body.body, cfg, "", headers);
+    allocator.free(response);
 }
 
 pub fn disabledRemoteControlResult(allocator: std.mem.Allocator) !CommandResult {

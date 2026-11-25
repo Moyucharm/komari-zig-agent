@@ -359,7 +359,7 @@ fn handleServerMessage(allocator: std.mem.Allocator, conn: *ws_client.Client, cf
             thread.detach();
         },
         .exec => {
-            const args = try ExecTaskArgs.init(allocator, cfg, msg);
+            const args = try ExecTaskArgs.init(allocator, cfg, v2_state.uploadProtocolVersion(), msg);
             errdefer args.deinit(allocator);
             const thread = try std.Thread.spawn(.{}, runExecTask, .{ allocator, args });
             thread.detach();
@@ -449,12 +449,14 @@ fn runPingTask(allocator: std.mem.Allocator, args: PingTaskArgs) void {
 
 const ExecTaskArgs = struct {
     cfg: config.Config,
+    protocol_version: i32,
     task_id: []const u8,
     command: []const u8,
 
-    fn init(allocator: std.mem.Allocator, cfg: config.Config, msg: ServerMessage) !ExecTaskArgs {
+    fn init(allocator: std.mem.Allocator, cfg: config.Config, protocol_version: i32, msg: ServerMessage) !ExecTaskArgs {
         return .{
             .cfg = cfg,
+            .protocol_version = protocol_version,
             .task_id = try allocator.dupe(u8, msg.task_id),
             .command = try allocator.dupe(u8, msg.command),
         };
@@ -468,7 +470,12 @@ const ExecTaskArgs = struct {
 
 fn runExecTask(allocator: std.mem.Allocator, args: ExecTaskArgs) void {
     defer args.deinit(allocator);
-    task.uploadExecResult(allocator, args.cfg, v2_state.uploadProtocolVersion(), args.task_id, args.command) catch {};
+    task.uploadExecResult(allocator, args.cfg, args.protocol_version, args.task_id, args.command) catch |err| {
+        var stdout_buf: [4096]u8 = undefined;
+        var stdout = compat.fileWriter(std.Io.File.stdout(), &stdout_buf);
+        defer stdout.flush() catch {};
+        stdout.print("Failed to upload task result: {s}\n", .{@errorName(err)}) catch {};
+    };
 }
 
 fn postV2ReportOnce(allocator: std.mem.Allocator, cfg: config.Config) !void {
@@ -562,7 +569,7 @@ fn processV2Event(allocator: std.mem.Allocator, conn: ?*ws_client.Client, cfg: c
     if (method.len == 0) return false;
     if (std.mem.eql(u8, method, v2.MethodAgentExec)) {
         const p = parseV2ExecParams(allocator, params) catch return false;
-        const args = ExecTaskArgs{ .cfg = cfg, .task_id = p.task_id, .command = p.command };
+        const args = ExecTaskArgs{ .cfg = cfg, .protocol_version = 2, .task_id = p.task_id, .command = p.command };
         const thread = std.Thread.spawn(.{}, runExecTask, .{ allocator, args }) catch {
             args.deinit(allocator);
             return false;
